@@ -3,6 +3,7 @@ package kerb
 import (
 	"crypto/hmac"
 	"crypto/md4"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rc4"
 	"crypto/subtle"
@@ -88,6 +89,8 @@ const (
 // Encryption algorithms
 const (
 	rc4HmacAlgorithm = 23
+	rc4HmacChecksum  = -138
+	md5Checksum = 7
 	defaultAlgorithm = rc4HmacAlgorithm
 )
 
@@ -117,7 +120,21 @@ var (
 	ErrParse    = errors.New("kerb: parse error")
 	ErrProtocol = errors.New("kerb: protocol error")
 
-	supportedAlgorithms = []int{18, 17, 16, rc4HmacAlgorithm}
+	supportedAlgorithms = []int{rc4HmacAlgorithm}
+
+	asRequestParam     = "application,explicit,tag:10"
+	tgsRequestParam    = "application,explicit,tag:12"
+	asReplyParam       = "application,explicit,tag:11"
+	tgsReplyParam      = "application,explicit,tag:13"
+	encAsReplyParam    = "application,explicit,tag:25"
+	encTgsReplyParam   = "application,explicit,tag:26"
+	ticketParam        = "application,explicit,tag:1"
+	encTicketParam     = "application,explicit,tag:3"
+	appRequestParam    = "application,explicit,tag:14"
+	authenticatorParam = "application,explicit,tag:2"
+	appReplyParam      = "application,explicit,tag:15"
+	encAppReplyParam   = "application,explicit,tag:27"
+	errorParam         = "application,explicit,tag:30"
 )
 
 type principalName struct {
@@ -136,31 +153,7 @@ type encryptionKey struct {
 	Key       []byte `asn1:"explicit,tag:1"`
 }
 
-/* Tickets are wrapped as
- * 1. Context-sensitive tag
- * 2. Application tag 1
- * 3. Universal tag 0 (sequence of)
- *
- * In order to do this:
- * 1. ticket is included as a member with the context sensitive tag, but not
- * explicit. This generates the context-sensitive tag, but nothing else.
- * 2. ticketInner has the application tag which provides #2
- * 3. ticketInner2 then provides #3
- *
- * We also catch the raw bytes with #2 and #3 in the Raw member so that when
- * we serialise the ticket back out in an app request we can use the original
- * data exactly as it was sent to us by the ticket generating service.
- */
 type ticket struct {
-	Raw         asn1.RawContent
-	ticketInner `asn1:"application,tag:1"`
-}
-
-type ticketInner struct {
-	ticketInner2
-}
-
-type ticketInner2 struct {
 	KeyVersion    int           `asn1:"explicit,tag:0"`
 	Realm         string        `asn1:"general,explicit,tag:1"`
 	Service       principalName `asn1:"explicit,tag:2"`
@@ -187,9 +180,9 @@ type preauth struct {
 	Data []byte `asn1:"explicit,tag:2"`
 }
 
-type checksum struct {
-	Type     int    `asn1:"explicit,tag:0"`
-	Checksum []byte `asn1:"explicit,tag:1"`
+type checksumData struct {
+	Type int    `asn1:"explicit,tag:0"`
+	Data []byte `asn1:"explicit,tag:1"`
 }
 
 type encryptedTimestamp struct {
@@ -212,26 +205,25 @@ type encryptedTicket struct {
 }
 
 type kdcRequest struct {
-	ProtoVersion   int       `asn1:"explicit,tag:1"`
-	MsgType        int       `asn1:"explicit,tag:2"`
-	Preauth        []preauth `asn1:"optional,explicit,tag:3"`
-	kdcRequestBody `asn1:"explicit,tag:4"`
+	ProtoVersion int           `asn1:"explicit,tag:1"`
+	MsgType      int           `asn1:"explicit,tag:2"`
+	Preauth      []preauth     `asn1:"optional,explicit,tag:3"`
+	Body         asn1.RawValue `asn1:"explicit,tag:4"`
 }
 
 type kdcRequestBody struct {
-	// Todo: does work with < 32 bits?
-	Flags             asn1.BitString `asn1:"explicit,tag:0"`
-	Client            principalName  `asn1:"optional,explicit,tag:1"`
-	Realm             string         `asn1:"general,explicit,tag:2"`
-	Service           principalName  `asn1:"optional,explicit,tag:3"`
-	From              time.Time      `asn1:"generalized,optional,explicit,tag:4"`
-	Till              time.Time      `asn1:"generalized,explicit,tag:5"`
-	RenewTill         time.Time      `asn1:"generalized,optional,explicit,tag:6"`
-	Nonce             uint32         `asn1:"explicit,tag:7"`
-	Algorithms        []int          `asn1:"explicit,tag:8"`
-	Addresses         []address      `asn1:"optional,explicit,tag:9"`
-	Authorization     encryptedData  `asn1:"optional,explicit,tag:10"`
-	AdditionalTickets []ticket       `asn1:"optional,explicit,tag:11"`
+	Flags             asn1.BitString  `asn1:"explicit,tag:0"`
+	Client            principalName   `asn1:"optional,explicit,tag:1"`
+	Realm             string          `asn1:"general,explicit,tag:2"`
+	Service           principalName   `asn1:"optional,explicit,tag:3"`
+	From              time.Time       `asn1:"generalized,optional,explicit,tag:4"`
+	Till              time.Time       `asn1:"generalized,explicit,tag:5"`
+	RenewTill         time.Time       `asn1:"generalized,optional,explicit,tag:6"`
+	Nonce             uint32          `asn1:"explicit,tag:7"`
+	Algorithms        []int           `asn1:"explicit,tag:8"`
+	Addresses         []address       `asn1:"optional,explicit,tag:9"`
+	Authorization     encryptedData   `asn1:"optional,explicit,tag:10"`
+	AdditionalTickets []asn1.RawValue `asn1:"optional,explicit,tag:11"`
 }
 
 type kdcReply struct {
@@ -240,7 +232,7 @@ type kdcReply struct {
 	Preauth      []preauth     `asn1:"optional,explicit,tag:2"`
 	Realm        string        `asn1:"general,explicit,tag:3"`
 	Client       principalName `asn1:"explicit,tag:4"`
-	Ticket       ticket        `asn1:"tag:5"`
+	Ticket       asn1.RawValue `asn1:"explicit,tag:5"`
 	Encrypted    encryptedData `asn1:"explicit,tag:6"`
 }
 
@@ -268,7 +260,7 @@ type appRequest struct {
 	ProtoVersion  int            `asn1:"explicit,tag:0"`
 	MsgType       int            `asn1:"explicit,tag:1"`
 	Flags         asn1.BitString `asn1:"explicit,tag:2"`
-	Ticket        ticket         `asn1:"explicit,tag:3"`
+	Ticket        asn1.RawValue  `asn1:"explicit,tag:3"`
 	Authenticator encryptedData  `asn1:"explicit,tag:4"`
 }
 
@@ -276,7 +268,7 @@ type authenticator struct {
 	ProtoVersion   int           `asn1:"explicit,tag:0"`
 	Realm          string        `asn1:"general,explicit,tag:1"`
 	Client         principalName `asn1:"explicit,tag:2"`
-	Checksum       checksum      `asn1:"optional,explicit,tag:3"`
+	Checksum       checksumData  `asn1:"optional,explicit,tag:3"`
 	Microseconds   int           `asn1:"explicit,tag:4"`
 	Time           time.Time     `asn1:"generalized,explicit,tag:5"`
 	SubKey         encryptionKey `asn1:"optional,explicit,tag:6"`
@@ -300,8 +292,8 @@ type encryptedAppReply struct {
 type errorMessage struct {
 	ProtoVersion       int           `asn1:"explicit,tag:0"`
 	MsgType            int           `asn1:"explicit,tag:1"`
-	ClientTime         time.Time     `asn1:"generalized,explicit,tag:2"`
-	ClientMicroseconds int           `asn1:"explicit,tag:3"`
+	ClientTime         time.Time     `asn1:"generalized,optional,explicit,tag:2"`
+	ClientMicroseconds int           `asn1:"optional,explicit,tag:3"`
 	ServerTime         time.Time     `asn1:"generalized,explicit,tag:4"`
 	ServerMicroseconds int           `asn1:"explicit,tag:5"`
 	ErrorCode          int           `asn1:"explicit,tag:6"`
@@ -336,6 +328,7 @@ func mustMarshal(val interface{}, params string) []byte {
 type cipher interface {
 	encrypt(d []byte, usage int) encryptedData
 	decrypt(d encryptedData, usage int) ([]byte, error)
+	checksum(d []byte, usage int) checksumData
 }
 
 type rc4HmacCipher struct {
@@ -343,6 +336,8 @@ type rc4HmacCipher struct {
 	kvno int
 }
 
+// rc4HmacKey converts a UTF8 password into a key suitable for use with the
+// rc4HmacCipher.
 func rc4HmacKey(password string) []byte {
 	// Convert password from UTF8 to UTF16-LE
 	s := make([]byte, 0)
@@ -360,7 +355,7 @@ func rc4HmacKey(password string) []byte {
 	return h.Sum(nil)
 }
 
-// RC4-HMAC has a few slight differences in the used usage values
+// RC4-HMAC has a few slight differences in the key usage values
 func rc4HmacUsage(usage int) uint32 {
 	switch usage {
 	case asReplyClientKey:
@@ -370,6 +365,19 @@ func rc4HmacUsage(usage int) uint32 {
 	}
 
 	return uint32(usage)
+}
+
+var rc4HmacChecksumKey = []byte("signaturekey\x00")
+
+func (c *rc4HmacCipher) checksum(data []byte, usage int) checksumData {
+	// TODO: replace with RC4-HMAC checksum algorithm. For now we are
+	// using the unkeyed RSA-MD5 checksum algorithm
+	h := md5.New()
+	h.Write(data)
+	return checksumData{
+		Type: md5Checksum,
+		Data: h.Sum(nil),
+	}
 }
 
 func (c *rc4HmacCipher) encrypt(data []byte, usage int) encryptedData {
@@ -471,24 +479,6 @@ func nextSequenceNumber() int {
 	return int(atomic.AddUint32(&usSequenceNumber, 1) % 1000000)
 }
 
-func (r *appRequest) init(t *Ticket, flags int) {
-	r.ProtoVersion = kerberosVersion
-	r.MsgType = appRequestType
-	r.Flags = flagsToBitString(flags)
-	r.Ticket = t.ticket
-
-	auth := authenticator{
-		ProtoVersion: kerberosVersion,
-		Realm:        t.realm,
-		Client:       splitPrincipal(t.principal),
-		Microseconds: nextSequenceNumber(),
-		Time:         time.Now(),
-	}
-
-	data := mustMarshal(auth, "application,explicit,tag:2")
-	r.Authenticator = t.cipher.encrypt(data, paTgsRequestKey)
-}
-
 type request struct {
 	principal string // sans realm
 	realm     string
@@ -549,46 +539,83 @@ func composePrincipal(n principalName) (string, error) {
 // such that if the remote receives multiple retries it discards the latters
 // as replays.
 func (r *request) send(sock io.Writer) error {
-	var err error
-	var params string
+	body := kdcRequestBody{
+		Realm:      r.realm,
+		Client:     splitPrincipal(r.principal),
+		Service:    splitPrincipal(r.service),
+		Flags:      flagsToBitString(r.flags),
+		Till:       r.till,
+		Nonce:      r.nonce,
+		Algorithms: supportedAlgorithms,
+	}
 
+	bodyData, err := asn1.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	reqParam := ""
 	req := kdcRequest{
 		ProtoVersion: kerberosVersion,
-		kdcRequestBody: kdcRequestBody{
-			Realm:      r.realm,
-			Client:     splitPrincipal(r.principal),
-			Service:    splitPrincipal(r.service),
-			Flags:      flagsToBitString(r.flags),
-			Till:       r.till,
-			Nonce:      r.nonce,
-			Algorithms: supportedAlgorithms,
-		},
+		Body:         asn1.RawValue{FullBytes: bodyData},
+		// MsgType and Preauth filled out below
 	}
 
 	if r.parent != nil {
 		// For TGS requests we stash an AP_REQ for the ticket granting
 		// service (using the krbtgt) as a preauth.
-		params = "application,explicit,tag:12"
+		reqParam = tgsRequestParam
 		req.MsgType = tgsRequestType
-		app := appRequest{}
-		app.init(r.parent, 0)
-		req.Preauth = make([]preauth, 1)
-		req.Preauth[0].Type = paTgsRequest
-		req.Preauth[0].Data = mustMarshal(app, "application,explicit,tag:14")
+
+		auth := authenticator{
+			ProtoVersion: kerberosVersion,
+			Realm:        r.parent.realm,
+			Client:       splitPrincipal(r.parent.principal),
+			Microseconds: nextSequenceNumber(),
+			Time:         time.Now(),
+			Checksum:     r.cipher.checksum(bodyData, paTgsRequestChecksumKey),
+		}
+
+		authData, err := asn1.MarshalWithParams(auth, authenticatorParam)
+		if err != nil {
+			return err
+		}
+
+		app := appRequest{
+			ProtoVersion:  kerberosVersion,
+			MsgType:       appRequestType,
+			Flags:         flagsToBitString(0),
+			Ticket:        r.parent.ticket,
+			Authenticator: r.cipher.encrypt(authData, paTgsRequestKey),
+		}
+
+		appData, err := asn1.MarshalWithParams(app, appRequestParam)
+		if err != nil {
+			return err
+		}
+
+		req.Preauth = []preauth{{paTgsRequest, appData}}
 	} else {
 		// For AS requests we add a PA-ENC-TIMESTAMP preauth, even if
 		// its always required rather than trying to handle the
 		// preauth error return.
-		params = "application,explicit,tag:10"
+		reqParam = asRequestParam
 		req.MsgType = asRequestType
-		ts := encryptedTimestamp{r.time, r.seqnum}
-		enc := r.cipher.encrypt(mustMarshal(ts, ""), paEncryptedTimestampKey)
-		req.Preauth = make([]preauth, 1)
-		req.Preauth[0].Type = paEncryptedTimestamp
-		req.Preauth[0].Data = mustMarshal(enc, "")
+
+		ts, err := asn1.Marshal(encryptedTimestamp{r.time, r.seqnum})
+		if err != nil {
+			return err
+		}
+
+		enc, err := asn1.Marshal(r.cipher.encrypt(ts, paEncryptedTimestampKey))
+		if err != nil {
+			return err
+		}
+
+		req.Preauth = []preauth{{paEncryptedTimestamp, enc}}
 	}
 
-	data, err := asn1.MarshalWithParams(req, params)
+	data, err := asn1.MarshalWithParams(req, reqParam)
 	if err != nil {
 		return err
 	}
@@ -614,8 +641,6 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 	} else {
 		read += n
 	}
-
-	fmt.Println(hex.EncodeToString(buf[:hsz]))
 
 	// We are expecting an outer asn1 wrapper with a constructed definite
 	// length and an application tag
@@ -654,8 +679,6 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 		sz = int(ulen)
 	}
 
-	fmt.Println(hex.EncodeToString(buf[:hsz]))
-
 	if n, err := io.ReadAtLeast(sock, buf[read:], hsz+sz-read); err != nil {
 		return nil, err
 	} else {
@@ -665,8 +688,7 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 	data := buf[hsz : hsz+sz]
 	rep := kdcReply{}
 	keyusage := 0
-
-	fmt.Println(hex.EncodeToString(data))
+	encparam := ""
 
 	switch msgtype {
 	case asReplyType:
@@ -675,6 +697,7 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 		}
 
 		keyusage = asReplyClientKey
+		encparam = encAsReplyParam
 
 	case tgsReplyType:
 		if r.parent == nil {
@@ -683,6 +706,7 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 
 		// We don't use sub keys
 		keyusage = tgsReplySessionKey
+		encparam = encTgsReplyParam
 
 	case errorType:
 		errmsg := errorMessage{}
@@ -700,9 +724,6 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 		return nil, err
 	}
 
-	fmt.Printf("request %+v %+v\n\n", r, r.cipher)
-	fmt.Printf("reply %+v\n\n", rep)
-
 	if rep.ProtoVersion != kerberosVersion {
 		return nil, ErrProtocol
 	}
@@ -717,27 +738,17 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 		return nil, ErrProtocol
 	}
 
+	// Decrypt the embedded data
+
 	dec, err := r.cipher.decrypt(rep.Encrypted, keyusage)
 	if err != nil {
 		return nil, err
 	}
 
 	enc := encryptedKdcReply{}
-
-	switch msgtype {
-	case asReplyType:
-		if _, err := asn1.UnmarshalWithParams(dec, &enc, "application,explicit,tag:25"); err != nil {
-			return nil, err
-		}
-	case tgsReplyType:
-		if _, err := asn1.UnmarshalWithParams(dec, &enc, "application,explicit,tag:26"); err != nil {
-			return nil, err
-		}
-	default:
-		panic("")
+	if _, err := asn1.UnmarshalWithParams(dec, &enc, encparam); err != nil {
+		return nil, err
 	}
-
-	fmt.Printf("encrypted reply %+v\n\n", enc)
 
 	if enc.Nonce != r.nonce || enc.Realm != r.realm {
 		return nil, ErrProtocol
@@ -750,7 +761,7 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 		return nil, err
 	}
 
-	cipher, err := loadKey(enc.Key.Algorithm, enc.Key.Key, rep.Ticket.KeyVersion)
+	cipher, err := loadKey(enc.Key.Algorithm, enc.Key.Key, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +783,7 @@ type Ticket struct {
 	service    string
 	principal  string
 	realm      string
-	ticket     ticket
+	ticket     asn1.RawValue
 	till       time.Time
 	renewTill  time.Time
 	flags      int
@@ -857,6 +868,7 @@ func NewTicket(principal string, password string, service string, till time.Time
 		return nil, ErrInvalidPrincipal{service}
 	}
 
+	// The realms must match
 	if len(sparts) == 2 && len(pparts) == 2 && sparts[1] != pparts[1] {
 		return nil, ErrInvalidPrincipal{service}
 	}
@@ -914,6 +926,7 @@ func (t *Ticket) GetSubTicket(service string, till time.Time, flags int) (*Ticke
 		flags:     flags,
 		till:      till,
 		service:   sparts[0],
+		parent: t,
 	}
 
 	// Default to using the parent's realm
@@ -935,7 +948,7 @@ func (t *Ticket) GetSubTicket(service string, till time.Time, flags int) (*Ticke
 		}
 
 		// Did we get the service we wanted
-		if tkt.service != r.service {
+		if tkt.service == r.service {
 			return tkt, nil
 		}
 
