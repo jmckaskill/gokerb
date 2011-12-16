@@ -201,9 +201,9 @@ const (
 )
 
 var (
-	ErrParse    = errors.New("kerb: parse error")
-	ErrProtocol = errors.New("kerb: protocol error")
-	ErrAuthLoop = errors.New("kerb: auth loop")
+	ErrParse         = errors.New("kerb: parse error")
+	ErrProtocol      = errors.New("kerb: protocol error")
+	ErrAuthLoop      = errors.New("kerb: auth loop")
 	ErrInvalidTicket = errors.New("kerb: invalid or expired ticket")
 
 	supportedAlgorithms = []int{rc4HmacAlgorithm}
@@ -221,6 +221,25 @@ var (
 	appReplyParam      = "application,explicit,tag:15"
 	encAppReplyParam   = "application,explicit,tag:27"
 	errorParam         = "application,explicit,tag:30"
+
+	negTokenInitParam = "explicit,tag:0"
+	negTokenReplyParam = "explicit,tag:0"
+
+	gssKrb5Oid    = asn1.ObjectIdentifier([]int{1, 2, 840, 113554, 1, 2, 2})
+	gssOldKrb5Oid = asn1.ObjectIdentifier([]int{1, 3, 5, 1, 5, 2})
+	gssMsKrb5Oid  = asn1.ObjectIdentifier([]int{1, 2, 840, 48018, 1, 2, 2})
+	gssSpnegoOid  = asn1.ObjectIdentifier([]int{1, 3, 6, 1, 5, 5, 2})
+)
+
+const (
+	// default of negTokenReply.State so it appears when State is not set
+	// in the asn1 marshalled stream
+	spnegoUseContext = iota - 1
+
+	spnegoAccepted
+	spnegoIncomplete
+	spnegoReject
+	spnegoRequestMIC
 )
 
 type principalName struct {
@@ -390,6 +409,17 @@ type errorMessage struct {
 	Service            principalName `asn1:"explicit,tag:10"`
 	ErrorText          string        `asn1:"general,optional,explicit,tag:11"`
 	ErrorData          []byte        `asn1:"optional,explicit,tag:12"`
+}
+
+type negTokenInit struct {
+	Mechanisms []asn1.ObjectIdentifier `asn1:"explicit,tag:0"`
+	Token      []byte                  `asn1:"explicit,tag:1"`
+}
+
+type negTokenReply struct {
+	State     int                   `asn1:"optional,explicit,tag:0,default:-1"`
+	Mechanism asn1.ObjectIdentifier `asn1:"optional,explicit,tag:1"`
+	Response  []byte                `asn1:"optional,explicit,tag:2"`
 }
 
 type RemoteError struct {
@@ -993,20 +1023,20 @@ func ResolveService(service, host string) (string, error) {
 }
 
 type replayKey struct {
-	keyType int
-	key string
-	time time.Time
-	microseconds int
+	keyType        int
+	key            string
+	time           time.Time
+	microseconds   int
 	sequenceNumber uint32
 }
 
 type Credential struct {
-	key       cipher
-	principal principalName
-	realm     string
-	cache     map[string]*Ticket
-	tgt       map[string]*Ticket
-	replay map[replayKey]bool
+	key             cipher
+	principal       principalName
+	realm           string
+	cache           map[string]*Ticket
+	tgt             map[string]*Ticket
+	replay          map[replayKey]bool
 	lastReplayPurge time.Time
 }
 
@@ -1203,6 +1233,84 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 	return nil, ErrAuthLoop
 }
 
+// GSS requests are a bit screwy in that they are partially asn1 The format
+// is:
+//
+// [APPLICATION 0] IMPLICIT SEQUENCE {
+//	mech OBJECT IDENTIFIER
+//	data of unknown type and may not be asn1
+// }
+//
+// To decode this we manually unpack the outer header, run the mech through
+// the asn1 unmarshaller and then return the rest of the data.
+
+type gssRequest struct {
+	Mechanism asn1.ObjectIdentifier
+	Data asn1.RawValue
+}
+
+var gssRequestParam = "application,tag:0"
+
+func encodeGssWrapper(oid asn1.ObjectIdentifier, data []byte) ([]byte, error) {
+	req := gssRequest{
+		Mechanism: oid,
+		Data: asn1.RawValue{FullBytes: data},
+	}
+
+	return asn1.MarshalWithParams(req, gssRequestParam)
+}
+
+func decodeGssWrapper(data []byte) (oid asn1.ObjectIdentifier, idata []byte, err error) {
+	if len(data) < 2 || data[0] != 0x60 {
+		err = ErrParse
+		return
+	}
+
+	isz := int(data[1])
+	data = data[2:]
+
+	// Note for the long forms, the data len must be >= 0x80 anyways
+	if isz > len(data) {
+		err = ErrParse
+		return
+	}
+
+	switch {
+	case isz == 0x84:
+		isz = int(data[0]<<24) + int(data[1]<<16) + int(data[2]<<8) + int(data[3])
+		data = data[4:]
+
+	case isz == 0x83:
+		isz = int(data[0]<<16) + int(data[1]<<8) + int(data[2])
+		data = data[3:]
+
+	case isz == 0x82:
+		isz = int(data[0]<<8) + int(data[1])
+		data = data[2:]
+
+	case isz == 0x81:
+		isz = int(data[0])
+		data = data[1:]
+
+	case isz <= 0x7F:
+		// short length form
+
+	default:
+		err = ErrParse
+		return
+	}
+
+	if isz < 0 || isz > len(data) {
+		err = ErrParse
+		return
+	}
+
+	data = data[:isz]
+	oid = asn1.ObjectIdentifier{}
+	idata, err = asn1.Unmarshal(data, &oid)
+	return
+}
+
 func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 	gssflags := byte(0)
 	if (flags & mutualRequired) != 0 {
@@ -1210,7 +1318,7 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 	}
 
 	// See RFC4121 4.1.1
-	gssdata := []byte{
+	gsschk := []byte{
 		// 0..3 Lgth: Number of bytes in Bnd field; Currently contains
 		// hex 10 00 00 00 (16, represented in little-endian form)
 		0x10, 0, 0, 0,
@@ -1237,7 +1345,7 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		Client:       t.client,
 		Microseconds: nextSequenceNumber() % 1000000,
 		Time:         time.Now(),
-		Checksum:     checksumData{gssFakeChecksum, gssdata},
+		Checksum:     checksumData{gssFakeChecksum, gsschk},
 	}
 
 	authdata, err := asn1.MarshalWithParams(auth, authenticatorParam)
@@ -1258,7 +1366,13 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		return err
 	}
 
-	if _, err := sock.Write(reqdata); err != nil {
+	reqdata = append([]byte{byte(appRequestType >> 8), byte(appRequestType)}, reqdata...)
+	gssdata, err := encodeGssWrapper(gssKrb5Oid, reqdata)
+	if err != nil {
+		return err
+	}
+
+	if _, err := sock.Write(gssdata); err != nil {
 		return err
 	}
 
@@ -1268,13 +1382,22 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 
 	// Now get the reply
 
-	repdata := bytes.NewBuffer(nil)
-	if _, err := io.Copy(repdata, sock); err != nil {
+	repbuf := bytes.NewBuffer(nil)
+	if _, err := io.Copy(repbuf, sock); err != nil {
 		return err
 	}
 
+	oid, repdata, err := decodeGssWrapper(repbuf.Bytes())
+	if err != nil {
+		return err
+	}
+
+	if !oid.Equal(gssKrb5Oid) || len(repdata) < 2 || binary.BigEndian.Uint16(repdata[:2]) != appReplyType {
+		return ErrProtocol
+	}
+
 	rep := appReply{}
-	if _, err := asn1.UnmarshalWithParams(repdata.Bytes(), &rep, appReplyParam); err != nil {
+	if _, err := asn1.UnmarshalWithParams(repdata[2:], &rep, appReplyParam); err != nil {
 		return err
 	}
 
@@ -1301,13 +1424,35 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 
 func (c *Credential) Accept(rw io.ReadWriter) error {
 	// TODO send error replies
-	reqdata := bytes.NewBuffer(nil)
-	if _, err := io.Copy(reqdata, rw); err != nil {
+	reqbuf := bytes.NewBuffer(nil)
+	if _, err := io.Copy(reqbuf, rw); err != nil {
 		return err
 	}
 
+	oid, reqdata, err := decodeGssWrapper(reqbuf.Bytes())
+	if err != nil {
+		return err
+	}
+
+	spnego := oid.Equal(gssSpnegoOid)
+	if spnego {
+		neg := negTokenInit{}
+		if _, err := asn1.UnmarshalWithParams(reqdata, &neg, negTokenInitParam); err != nil {
+			return err
+		}
+
+		oid, reqdata, err = decodeGssWrapper(neg.Token)
+		if err != nil {
+			return err
+		}
+	}
+
+	if !oid.Equal(gssKrb5Oid) && !oid.Equal(gssMsKrb5Oid) {
+		return ErrProtocol
+	}
+
 	req := appRequest{}
-	if _, err := asn1.UnmarshalWithParams(reqdata.Bytes(), &req, appRequestParam); err != nil {
+	if _, err := asn1.UnmarshalWithParams(reqdata, &req, appRequestParam); err != nil {
 		return err
 	}
 
@@ -1369,10 +1514,10 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 	// Now check for replays
 
 	rkey := replayKey{
-		keyType:       etkt.Key.Algorithm,
-		key:           string(etkt.Key.Key),
-		time:          auth.Time,
-		microseconds:  auth.Microseconds,
+		keyType:        etkt.Key.Algorithm,
+		key:            string(etkt.Key.Key),
+		time:           auth.Time,
+		microseconds:   auth.Microseconds,
 		sequenceNumber: auth.SequenceNumber,
 	}
 
@@ -1421,7 +1566,31 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 		return err
 	}
 
-	if _, err := rw.Write(repdata); err != nil {
+	repdata = append([]byte{byte(appReplyType >> 8), byte(appReplyType)}, repdata...)
+	gssrep, err := encodeGssWrapper(oid, repdata)
+	if err != nil {
+		return err
+	}
+
+	if spnego {
+		srep := negTokenReply{
+			State:     spnegoAccepted,
+			Mechanism: oid,
+			Response:  gssrep,
+		}
+
+		repdata, err := asn1.MarshalWithParams(srep, negTokenReplyParam)
+		if err != nil {
+			return err
+		}
+
+		gssrep, err = encodeGssWrapper(gssSpnegoOid, repdata)
+		if err != nil {
+			return err
+		}
+	}
+
+	if _, err := rw.Write(gssrep); err != nil {
 		return err
 	}
 
