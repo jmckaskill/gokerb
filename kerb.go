@@ -1,6 +1,7 @@
 package kerb
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/md4"
 	"crypto/md5"
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -127,11 +129,14 @@ const (
 	mutualRequired
 )
 
-// Key usage
+// gss app request flags
 const (
-	asReqPreauthTimestamp = iota
-	kdcReplyTicket
-	kdcReplyEncryptedPart
+	gssDelegation = 1 << iota
+	gssMutual
+	gssReplay
+	gssSequence
+	gssConfidentiality
+	gssIntegrity
 )
 
 // Address type
@@ -168,6 +173,7 @@ const (
 	rc4HmacAlgorithm = 23
 	rc4HmacChecksum  = -138
 	md5Checksum      = 7
+	gssFakeChecksum  = 0x8003
 )
 
 // Key usage values
@@ -198,6 +204,7 @@ var (
 	ErrParse    = errors.New("kerb: parse error")
 	ErrProtocol = errors.New("kerb: protocol error")
 	ErrAuthLoop = errors.New("kerb: auth loop")
+	ErrInvalidTicket = errors.New("kerb: invalid or expired ticket")
 
 	supportedAlgorithms = []int{rc4HmacAlgorithm}
 
@@ -233,10 +240,10 @@ type encryptionKey struct {
 }
 
 type ticket struct {
-	KeyVersion    int           `asn1:"explicit,tag:0"`
-	Realm         string        `asn1:"general,explicit,tag:1"`
-	Service       principalName `asn1:"explicit,tag:2"`
-	EncryptedData encryptedData `asn1:"explicit,tag:3"`
+	KeyVersion int           `asn1:"explicit,tag:0"`
+	Realm      string        `asn1:"general,explicit,tag:1"`
+	Service    principalName `asn1:"explicit,tag:2"`
+	Encrypted  encryptedData `asn1:"explicit,tag:3"`
 }
 
 type transitedEncoding struct {
@@ -363,10 +370,10 @@ type appReply struct {
 }
 
 type encryptedAppReply struct {
-	Time           time.Time     `asn1:"generalized,explicit,tag:0"`
-	Microseconds   int           `asn1:"explicit,tag:1"`
-	SubKey         encryptionKey `asn1:"optional,explicit,tag:2"`
-	SequenceNumber uint32        `asn1:"optional,explicit,tag:3"`
+	ClientTime         time.Time     `asn1:"generalized,explicit,tag:0"`
+	ClientMicroseconds int           `asn1:"explicit,tag:1"`
+	SubKey             encryptionKey `asn1:"optional,explicit,tag:2"`
+	SequenceNumber     uint32        `asn1:"optional,explicit,tag:3"`
 }
 
 type errorMessage struct {
@@ -817,6 +824,8 @@ func (r *request) recvReply() (*Ticket, error) {
 
 	// TODO use enc.Flags to mask out flags which the server refused
 	return &Ticket{
+		client:    r.client,
+		crealm:    r.crealm,
 		service:   enc.Service,
 		srealm:    enc.ServiceRealm,
 		ticket:    rep.Ticket.FullBytes,
@@ -828,6 +837,8 @@ func (r *request) recvReply() (*Ticket, error) {
 }
 
 type Ticket struct {
+	client    principalName
+	crealm    string
 	service   principalName
 	srealm    string
 	ticket    []byte
@@ -981,12 +992,22 @@ func ResolveService(service, host string) (string, error) {
 	return fmt.Sprintf("%s/%s", service, name), nil
 }
 
+type replayKey struct {
+	keyType int
+	key string
+	time time.Time
+	microseconds int
+	sequenceNumber uint32
+}
+
 type Credential struct {
 	key       cipher
 	principal principalName
 	realm     string
 	cache     map[string]*Ticket
 	tgt       map[string]*Ticket
+	replay map[replayKey]bool
+	lastReplayPurge time.Time
 }
 
 // NewCredential creates a new client credential that can be used to get
@@ -1183,20 +1204,228 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 }
 
 func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
-	/*
-		req := appRequest{
-			ProtoVersion: kerberosVersion,
-			MsgType: appRequestType,
-			Flags: flagsToBitString(flags),
-			Ticket: t.ticket,
-			Authenticator: t.cipher.encrypt(appData, appRequestAuthKey),
-		}
-	*/
-	panic("todo")
+	gssflags := byte(0)
+	if (flags & mutualRequired) != 0 {
+		gssflags |= gssMutual
+	}
+
+	// See RFC4121 4.1.1
+	gssdata := []byte{
+		// 0..3 Lgth: Number of bytes in Bnd field; Currently contains
+		// hex 10 00 00 00 (16, represented in little-endian form)
+		0x10, 0, 0, 0,
+		// 4..19 Bnd: MD5 hash of channel bindings, taken over all
+		// non-null components of bindings, in order of declaration.
+		// Integer fields within channel bindings are represented in
+		// little-endian order for the purposes of the MD5
+		// calculation.
+		0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0,
+		// 20..23 Flags: Bit vector of context-establishment flags, with
+		// values consistent with RFC-1509, p. 41. The resulting bit
+		// vector is encoded into bytes 20..23 in little-endian form.
+		gssflags, 0, 0, 0,
+		// 24..25 DlgOpt The Delegation Option identifier (=1) [optional]
+		// 26..27 Dlgth: The length of the Deleg field. [optional]
+		// 28..(n-1) Deleg: A KRB_CRED message (n = Dlgth + 28) [optional]
+		// n..last Exts: Extensions [optional].
+	}
+
+	auth := authenticator{
+		ProtoVersion: kerberosVersion,
+		ClientRealm:  t.crealm,
+		Client:       t.client,
+		Microseconds: nextSequenceNumber() % 1000000,
+		Time:         time.Now(),
+		Checksum:     checksumData{gssFakeChecksum, gssdata},
+	}
+
+	authdata, err := asn1.MarshalWithParams(auth, authenticatorParam)
+	if err != nil {
+		return err
+	}
+
+	req := appRequest{
+		ProtoVersion:  kerberosVersion,
+		MsgType:       appRequestType,
+		Flags:         flagsToBitString(flags),
+		Ticket:        asn1.RawValue{FullBytes: t.ticket},
+		Authenticator: t.key.encrypt(authdata, appRequestAuthKey),
+	}
+
+	reqdata, err := asn1.MarshalWithParams(req, appRequestParam)
+	if err != nil {
+		return err
+	}
+
+	if _, err := sock.Write(reqdata); err != nil {
+		return err
+	}
+
+	if (flags & mutualRequired) == 0 {
+		return nil
+	}
+
+	// Now get the reply
+
+	repdata := bytes.NewBuffer(nil)
+	if _, err := io.Copy(repdata, sock); err != nil {
+		return err
+	}
+
+	rep := appReply{}
+	if _, err := asn1.UnmarshalWithParams(repdata.Bytes(), &rep, appReplyParam); err != nil {
+		return err
+	}
+
+	if rep.ProtoVersion != kerberosVersion || rep.MsgType != appReplyType {
+		return ErrProtocol
+	}
+
+	edata, err := t.key.decrypt(rep.Encrypted, appReplyEncryptedKey)
+	if err != nil {
+		return err
+	}
+
+	erep := encryptedAppReply{}
+	if _, err := asn1.UnmarshalWithParams(edata, &erep, encAppReplyParam); err != nil {
+		return err
+	}
+
+	if !erep.ClientTime.Equal(auth.Time) || erep.ClientMicroseconds != auth.Microseconds || erep.SequenceNumber != auth.SequenceNumber {
+		return ErrProtocol
+	}
+
+	return nil
 }
 
-func (t *Ticket) Accept(sock io.ReadWriter, flags int) error {
-	panic("todo")
+func (c *Credential) Accept(rw io.ReadWriter) error {
+	// TODO send error replies
+	reqdata := bytes.NewBuffer(nil)
+	if _, err := io.Copy(reqdata, rw); err != nil {
+		return err
+	}
+
+	req := appRequest{}
+	if _, err := asn1.UnmarshalWithParams(reqdata.Bytes(), &req, appRequestParam); err != nil {
+		return err
+	}
+
+	if req.ProtoVersion != kerberosVersion || req.MsgType != appRequestType {
+		return ErrProtocol
+	}
+
+	// Check the ticket
+
+	tkt := ticket{}
+	if _, err := asn1.UnmarshalWithParams(req.Ticket.FullBytes, &tkt, ticketParam); err != nil {
+		return err
+	}
+
+	if tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
+		return ErrInvalidTicket
+	}
+
+	etktdata, err := c.key.decrypt(tkt.Encrypted, ticketKey)
+	if err != nil {
+		return err
+	}
+
+	etkt := encryptedTicket{}
+	if _, err := asn1.UnmarshalWithParams(etktdata, &etkt, encTicketParam); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	if (etkt.From != time.Time{} && now.Before(etkt.From)) || now.After(etkt.Till) {
+		return ErrInvalidTicket
+	}
+
+	tkey, err := loadKey(etkt.Key.Algorithm, etkt.Key.Key, tkt.KeyVersion)
+	if err != nil {
+		return err
+	}
+
+	// Check the authenticator
+
+	authdata, err := tkey.decrypt(req.Authenticator, appRequestAuthKey)
+	if err != nil {
+		return err
+	}
+
+	auth := authenticator{}
+	if _, err := asn1.UnmarshalWithParams(authdata, &auth, authenticatorParam); err != nil {
+		return err
+	}
+
+	if auth.ProtoVersion != kerberosVersion || auth.ClientRealm != etkt.ClientRealm || !nameEquals(auth.Client, etkt.Client) {
+		return ErrProtocol
+	}
+
+	if math.Abs(float64(now.Sub(auth.Time))) > float64(time.Minute*5) {
+		return ErrProtocol
+	}
+
+	// Now check for replays
+
+	rkey := replayKey{
+		keyType:       etkt.Key.Algorithm,
+		key:           string(etkt.Key.Key),
+		time:          auth.Time,
+		microseconds:  auth.Microseconds,
+		sequenceNumber: auth.SequenceNumber,
+	}
+
+	if _, ok := c.replay[rkey]; ok {
+		return ErrProtocol
+	}
+
+	// Check for an empty replay cache so that we can initialise c.lastReplayPurge
+	if len(c.replay) == 0 || now.Sub(c.lastReplayPurge) > time.Minute*10 {
+		for rkey := range c.replay {
+			if now.Sub(rkey.time) > time.Minute*10 {
+				delete(c.replay, rkey)
+			}
+		}
+
+		c.lastReplayPurge = now
+	}
+
+	c.replay[rkey] = true
+
+	if (bitStringToFlags(req.Flags) & mutualRequired) == 0 {
+		return nil
+	}
+
+	// Now send the reply
+
+	enc := encryptedAppReply{
+		ClientTime:         auth.Time,
+		ClientMicroseconds: auth.Microseconds,
+		SequenceNumber:     auth.SequenceNumber,
+	}
+
+	edata, err := asn1.MarshalWithParams(enc, encAppReplyParam)
+	if err != nil {
+		return err
+	}
+
+	rep := appReply{
+		ProtoVersion: kerberosVersion,
+		MsgType:      appReplyType,
+		Encrypted:    tkey.encrypt(edata, appReplyEncryptedKey),
+	}
+
+	repdata, err := asn1.MarshalWithParams(rep, appReplyParam)
+	if err != nil {
+		return err
+	}
+
+	if _, err := rw.Write(repdata); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (c *Credential) Principal() string {
@@ -1217,11 +1446,6 @@ func (t *Ticket) Realm() string {
 
 func (t *Ticket) ExpiryTime() time.Time {
 	return t.till
-}
-
-type keytabEntry struct {
-	size          int32
-	numComponents uint16
 }
 
 const (
