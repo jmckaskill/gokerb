@@ -29,7 +29,7 @@ const (
 	AllowPostdate               = 1 << 26
 	Postdated                   = 1 << 25
 	Renewable                   = 1 << 23
-	canonicalize                = 1 << 16
+	Canonicalize                = 1 << 16
 	DisableTransitedCheck       = 1 << 5
 	RenewableOk                 = 1 << 4
 	EncryptedTicketInSessionKey = 1 << 3
@@ -37,6 +37,87 @@ const (
 	Validate                    = 1 << 0
 
 	defaultLoginFlags = 0
+)
+
+// Remote error codes
+const (
+	KDC_ERR_NONE                 = iota // No error
+	KDC_ERR_NAME_EXP                    // Client's entry in database has expired
+	KDC_ERR_SERVICE_EXP                 // Server's entry in database has expired
+	KDC_ERR_BAD_PVNO                    // Requested protocol version number not supported
+	KDC_ERR_C_OLD_MAST_KVNO             // Client's key encrypted in old master key
+	KDC_ERR_S_OLD_MAST_KVNO             // Server's key encrypted in old master key
+	KDC_ERR_C_PRINCIPAL_UNKNOWN         // Client not found in Kerberos database
+	KDC_ERR_S_PRINCIPAL_UNKNOWN         // Server not found in Kerberos database
+	KDC_ERR_PRINCIPAL_NOT_UNIQUE        // Multiple principal entries in database
+	KDC_ERR_NULL_KEY                    // The client or server has a null key
+	KDC_ERR_CANNOT_POSTDATE             // Ticket not eligible for postdating
+	KDC_ERR_NEVER_VALID                 // Requested starttime is later than end time
+	KDC_ERR_POLICY                      // KDC policy rejects request
+	KDC_ERR_BADOPTION                   // KDC cannot accommodate requested option
+	KDC_ERR_ETYPE_NOSUPP                // KDC has no support for encryption type
+	KDC_ERR_SUMTYPE_NOSUPP              // KDC has no support for checksum type
+	KDC_ERR_PADATA_TYPE_NOSUPP          // KDC has no support for padata type
+	KDC_ERR_TRTYPE_NOSUPP               // KDC has no support for transited type
+	KDC_ERR_CLIENT_REVOKED              // Clients credentials have been revoked
+	KDC_ERR_SERVICE_REVOKED             // Credentials for server have been revoked
+	KDC_ERR_TGT_REVOKED                 // TGT has been revoked
+	KDC_ERR_CLIENT_NOTYET               // Client not yet valid; try again later
+	KDC_ERR_SERVICE_NOTYET              // Server not yet valid; try again later
+	KDC_ERR_KEY_EXPIRED                 // Password has expired; change password to reset
+	KDC_ERR_PREAUTH_FAILED              // Pre-authentication information was invalid
+	KDC_ERR_PREAUTH_REQUIRED            // Additional pre-authentication required
+	KDC_ERR_SERVER_NOMATCH              // Requested server and ticket don't match
+	KDC_ERR_MUST_USE_USER2USER          // Server principal valid for user2user only
+	KDC_ERR_PATH_NOT_ACCEPTED           // KDC Policy rejects transited path
+	KDC_ERR_SVC_UNAVAILABLE             // A service is not available
+	_
+	KRB_AP_ERR_BAD_INTEGRITY // Integrity check on decrypted field failed
+	KRB_AP_ERR_TKT_EXPIRED   // Ticket expired
+	KRB_AP_ERR_TKT_NYV       // Ticket not yet valid
+	KRB_AP_ERR_REPEAT        // Request is a replay
+	KRB_AP_ERR_NOT_US        // The ticket isn't for us
+	KRB_AP_ERR_BADMATCH      // Ticket and authenticator don't match
+	KRB_AP_ERR_SKEW          // Clock skew too great
+	KRB_AP_ERR_BADADDR       // Incorrect net address
+	KRB_AP_ERR_BADVERSION    // Protocol version mismatch
+	KRB_AP_ERR_MSG_TYPE      // Invalid msg type
+	KRB_AP_ERR_MODIFIED      // Message stream modified
+	KRB_AP_ERR_BADORDER      // Message out of order
+	_
+	KRB_AP_ERR_BADKEYVER     // Specified version of key is not available
+	KRB_AP_ERR_NOKEY         // Service key not available
+	KRB_AP_ERR_MUT_FAIL      // Mutual authentication failed
+	KRB_AP_ERR_BADDIRECTION  // Incorrect message direction
+	KRB_AP_ERR_METHOD        // Alternative authentication method required
+	KRB_AP_ERR_BADSEQ        // Incorrect sequence number in message
+	KRB_AP_ERR_INAPP_CKSUM   // Inappropriate type of checksum in message
+	KRB_AP_PATH_NOT_ACCEPTED // Policy rejects transited path
+	KRB_ERR_RESPONSE_TOO_BIG // Response too big for UDP; retry with TCP
+	_
+	_
+	_
+	_
+	_
+	_
+	_
+	KRB_ERR_GENERIC                       // Generic error (description in e-text)
+	KRB_ERR_FIELD_TOOLONG                 // Field is too long for this implementation
+	KDC_ERROR_CLIENT_NOT_TRUSTED          // Reserved for PKINIT
+	KDC_ERROR_KDC_NOT_TRUSTED             // Reserved for PKINIT
+	KDC_ERROR_INVALID_SIG                 // Reserved for PKINIT
+	KDC_ERR_KEY_TOO_WEAK                  // Reserved for PKINIT
+	KDC_ERR_CERTIFICATE_MISMATCH          // Reserved for PKINIT
+	KRB_AP_ERR_NO_TGT                     // No TGT available to validate USER-TO-USER
+	KDC_ERR_WRONG_REALM                   // Reserved for future use
+	KRB_AP_ERR_USER_TO_USER_REQUIRED      // Ticket must be for USER-TO-USER
+	KDC_ERR_CANT_VERIFY_CERTIFICATE       // Reserved for PKINIT
+	KDC_ERR_INVALID_CERTIFICATE           // Reserved for PKINIT
+	KDC_ERR_REVOKED_CERTIFICATE           // Reserved for PKINIT
+	KDC_ERR_REVOCATION_STATUS_UNKNOWN     // Reserved for PKINIT
+	KDC_ERR_REVOCATION_STATUS_UNAVAILABLE // Reserved for PKINIT
+	KDC_ERR_CLIENT_NAME_MISMATCH          // Reserved for PKINIT
+	KDC_ERR_KDC_NAME_MISMATCH             // Reserved for PKINIT
 )
 
 // App request flags
@@ -110,11 +191,13 @@ const (
 	applicationClass     = 0x40
 	udpReadTimeout       = 3e9
 	defaultLoginDuration = time.Hour * 24
+	maxUdpWrite          = 1400 // TODO: figure out better way of doing this
 )
 
 var (
 	ErrParse    = errors.New("kerb: parse error")
 	ErrProtocol = errors.New("kerb: protocol error")
+	ErrAuthLoop = errors.New("kerb: auth loop")
 
 	supportedAlgorithms = []int{rc4HmacAlgorithm}
 
@@ -302,8 +385,16 @@ type errorMessage struct {
 	ErrorData          []byte        `asn1:"optional,explicit,tag:12"`
 }
 
-func (e *errorMessage) Error() string {
-	return fmt.Sprintf("kerb: remote error %d", e.ErrorCode)
+type RemoteError struct {
+	msg *errorMessage
+}
+
+func (e RemoteError) ErrorCode() int {
+	return e.msg.ErrorCode
+}
+
+func (e RemoteError) Error() string {
+	return fmt.Sprintf("kerb: remote error %d", e.msg.ErrorCode)
 }
 
 type cipher interface {
@@ -465,15 +556,19 @@ func nextSequenceNumber() int {
 type request struct {
 	client  principalName
 	crealm  string
-	cipher  cipher
+	ckey    cipher // only needed for AS requests when tgt == nil
 	service principalName
 	srealm  string
 	till    time.Time
 	flags   int
-	parent  *Ticket
-	nonce   uint32
-	time    time.Time
-	seqnum  int
+	tgt     *Ticket
+
+	// Setup by request.do()
+	nonce  uint32
+	time   time.Time
+	seqnum int
+	sock   net.Conn
+	proto  string
 }
 
 func nameEquals(a, b principalName) bool {
@@ -515,13 +610,13 @@ func composePrincipal(n principalName) string {
 	return strings.Join(n.Parts, "/")
 }
 
-// send sends a single ticket request down the sock writer. If r.parent is set
+// send sends a single ticket request down the sock writer. If r.tgt is set
 // this is a ticket granting service request, otherwise its an authentication
 // service request. Note this does not use any random data, so resending will
 // generate the exact same byte stream. This is needed with UDP connections
 // such that if the remote receives multiple retries it discards the latters
 // as replays.
-func (r *request) send(sock io.Writer) error {
+func (r *request) sendRequest() error {
 	body := kdcRequestBody{
 		Client:       r.client,
 		ServiceRealm: r.srealm,
@@ -544,7 +639,7 @@ func (r *request) send(sock io.Writer) error {
 		// MsgType and Preauth filled out below
 	}
 
-	if r.parent != nil {
+	if r.tgt != nil {
 		// For TGS requests we stash an AP_REQ for the ticket granting
 		// service (using the krbtgt) as a preauth.
 		reqParam = tgsRequestParam
@@ -556,7 +651,7 @@ func (r *request) send(sock io.Writer) error {
 			Client:       r.client,
 			Microseconds: r.seqnum % 1000000,
 			Time:         r.time,
-			Checksum:     r.cipher.checksum(bodyData, paTgsRequestChecksumKey),
+			Checksum:     r.tgt.key.checksum(bodyData, paTgsRequestChecksumKey),
 		}
 
 		authData, err := asn1.MarshalWithParams(auth, authenticatorParam)
@@ -568,8 +663,8 @@ func (r *request) send(sock io.Writer) error {
 			ProtoVersion:  kerberosVersion,
 			MsgType:       appRequestType,
 			Flags:         flagsToBitString(0),
-			Ticket:        asn1.RawValue{FullBytes: r.parent.ticket},
-			Authenticator: r.cipher.encrypt(authData, paTgsRequestKey),
+			Ticket:        asn1.RawValue{FullBytes: r.tgt.ticket},
+			Authenticator: r.tgt.key.encrypt(authData, paTgsRequestKey),
 		}
 
 		appData, err := asn1.MarshalWithParams(app, appRequestParam)
@@ -590,7 +685,7 @@ func (r *request) send(sock io.Writer) error {
 			return err
 		}
 
-		enc, err := asn1.Marshal(r.cipher.encrypt(ts, paEncryptedTimestampKey))
+		enc, err := asn1.Marshal(r.ckey.encrypt(ts, paEncryptedTimestampKey))
 		if err != nil {
 			return err
 		}
@@ -603,139 +698,102 @@ func (r *request) send(sock io.Writer) error {
 		return err
 	}
 
-	if _, err := sock.Write(data); err != nil {
+	if r.proto == "tcp" {
+		if err := binary.Write(r.sock, binary.BigEndian, uint32(len(data))); err != nil {
+			return err
+		}
+	}
+
+	if r.proto == "udp" && len(data) > maxUdpWrite {
+		return io.ErrShortWrite
+	}
+
+	if _, err := r.sock.Write(data); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func readMessage(r io.Reader) (msgtype int, data []byte, err error) {
-	buf := [4096]byte{}
-	read := 0
-	hsz := 2
+func (r *request) recvReply() (*Ticket, error) {
+	var data []byte
 
-	// Decode the message asn1 header so we can figure out which message
-	// we have and also the message length (needed for stream
-	// connections).
-
-	n, err := io.ReadAtLeast(r, buf[read:], hsz-read)
-	if err != nil {
-		return
-	}
-	read += n
-
-	// We are expecting an outer asn1 wrapper with a constructed definite
-	// length and an application tag
-	if class := buf[0] & 0xC0; class != applicationClass {
-		err = ErrParse
-		return
-	}
-
-	// Check that we have a constructed length
-	if (buf[0] & 0x20) == 0 {
-		err = ErrParse
-		return
-	}
-
-	sz := int(buf[1])
-
-	// Check that we don't have an indefinite length or a long form thats too long
-	if sz == 0x80 || sz > 0x83 {
-		err = ErrParse
-		return
-	}
-
-	// Handle the long form
-	if sz > 0x80 {
-		hsz += sz & 0x7F
-
-		n, err = io.ReadAtLeast(r, buf[read:], hsz-read)
-		if err != nil {
-			return
-		}
-		read += n
-
-		sb := [4]byte{}
-		for i, j := hsz-1, 0; i >= 2; i, j = i-1, j+1 {
-			sb[j] = buf[i]
-		}
-		ulen := binary.LittleEndian.Uint32(sb[:])
-		sz = int(ulen)
-	}
-
-	n, err = io.ReadAtLeast(r, buf[read:], hsz+sz-read)
-	if err != nil {
-		return
-	}
-	read += n
-
-	msgtype = int(buf[0] & 0x1F)
-	data = buf[hsz : hsz+sz]
-	return
-}
-
-func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
-	rep := kdcReply{}
-	keyusage := 0
-	encparam := ""
-
-	msgtype, data, err := readMessage(sock)
-	if err != nil {
-		return nil, err
-	}
-
-	switch msgtype {
-	case asReplyType:
-		if r.parent != nil {
-			return nil, ErrParse
-		}
-
-		keyusage = asReplyClientKey
-		encparam = encAsReplyParam
-
-	case tgsReplyType:
-		if r.parent == nil {
-			return nil, ErrParse
-		}
-
-		// We don't use sub keys
-		keyusage = tgsReplySessionKey
-		encparam = encTgsReplyParam
-
-	case errorType:
-		errmsg := errorMessage{}
-		if _, err := asn1.Unmarshal(data, &errmsg); err != nil {
+	switch r.proto {
+	case "tcp":
+		// TCP streams prepend a 32bit big endian size before each PDU
+		var size uint32
+		if err := binary.Read(r.sock, binary.BigEndian, &size); err != nil {
 			return nil, err
 		}
 
-		return nil, &errmsg
+		data = make([]byte, size)
+
+		if _, err := io.ReadFull(r.sock, data); err != nil {
+			return nil, err
+		}
+
+	case "udp":
+		// UDP PDUs are packed in individual frames
+		data = make([]byte, 4096)
+
+		n, err := r.sock.Read(data)
+		if err != nil {
+			return nil, err
+		}
+
+		data = data[:n]
 
 	default:
+		panic("")
+	}
+
+	if len(data) == 0 {
 		return nil, ErrParse
 	}
 
-	if _, err := asn1.Unmarshal(data, &rep); err != nil {
+	if (data[0] & 0x1F) == errorType {
+		errmsg := errorMessage{}
+		if _, err := asn1.UnmarshalWithParams(data, &errmsg, errorParam); err != nil {
+			return nil, err
+		}
+		return nil, RemoteError{&errmsg}
+	}
+
+	var msgtype, usage int
+	var repparam, encparam string
+	var key cipher
+
+	if r.tgt != nil {
+		repparam = tgsReplyParam
+		msgtype = tgsReplyType
+		key = r.tgt.key
+		usage = tgsReplySessionKey
+		encparam = encTgsReplyParam
+	} else {
+		repparam = asReplyParam
+		msgtype = asReplyType
+		key = r.ckey
+		usage = asReplyClientKey
+		encparam = encAsReplyParam
+	}
+
+	// Decode reply body
+
+	rep := kdcReply{}
+	if _, err := asn1.UnmarshalWithParams(data, &rep, repparam); err != nil {
 		return nil, err
 	}
 
-	if rep.ProtoVersion != kerberosVersion {
+	if rep.MsgType != msgtype || rep.ProtoVersion != kerberosVersion || !nameEquals(rep.Client, r.client) || rep.ClientRealm != r.crealm {
 		return nil, ErrProtocol
 	}
 
-	if rep.MsgType != msgtype || !nameEquals(rep.Client, r.client) || rep.ClientRealm != r.crealm {
-		return nil, ErrProtocol
-	}
-
-	// Decrypt the embedded data
-
-	dec, err := r.cipher.decrypt(rep.Encrypted, keyusage)
-	if err != nil {
-		return nil, err
-	}
+	// Decode encrypted part
 
 	enc := encryptedKdcReply{}
-	if _, err := asn1.UnmarshalWithParams(dec, &enc, encparam); err != nil {
+	if edata, err := key.decrypt(rep.Encrypted, usage); err != nil {
+		return nil, err
+	} else if _, err := asn1.UnmarshalWithParams(edata, &enc, encparam); err != nil {
 		return nil, err
 	}
 
@@ -745,12 +803,14 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 		return nil, ErrProtocol
 	}
 
-	ticket := ticket{}
-	if _, err := asn1.UnmarshalWithParams(rep.Ticket.FullBytes, &ticket, ticketParam); err != nil {
+	// Decode ticket
+
+	tkt := ticket{}
+	if _, err := asn1.UnmarshalWithParams(rep.Ticket.FullBytes, &tkt, ticketParam); err != nil {
 		return nil, err
 	}
 
-	cipher, err := loadKey(enc.Key.Algorithm, enc.Key.Key, ticket.KeyVersion)
+	key, err := loadKey(enc.Key.Algorithm, enc.Key.Key, tkt.KeyVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -758,76 +818,38 @@ func (r *request) recvReply(sock io.Reader, stream bool) (*Ticket, error) {
 	// TODO use enc.Flags to mask out flags which the server refused
 	return &Ticket{
 		service:   enc.Service,
-		client:    r.client,
 		srealm:    enc.ServiceRealm,
-		crealm:    r.crealm,
 		ticket:    rep.Ticket.FullBytes,
 		till:      enc.Till,
 		renewTill: enc.RenewTill,
 		flags:     r.flags,
-		cipher:    cipher,
+		key:       key,
 	}, nil
 }
 
 type Ticket struct {
 	service   principalName
-	client    principalName
-	crealm    string
 	srealm    string
 	ticket    []byte
 	till      time.Time
 	renewTill time.Time
 	flags     int
-	cipher    cipher
+	key       cipher
 	sock      net.Conn
-	stream    bool
+	proto     string
 }
 
-type timeoutError interface {
-	Timeout() bool
-}
-
-func (r *request) do(sock net.Conn, stream bool) (tkt *Ticket, err error) {
-	if err = binary.Read(rand.Reader, binary.BigEndian, &r.nonce); err != nil {
-		return nil, err
+func open(proto, realm string) (net.Conn, error) {
+	if proto != "tcp" && proto != "udp" {
+		panic("invalid protocol: " + proto)
 	}
 
-	// Reduce the entropy of the nonce to 31 bits to ensure it fits in a 4
-	// byte asn.1 value. Active directory seems to need this.
-	r.nonce >>= 1
-	r.time = time.Now()
-	r.seqnum = nextSequenceNumber()
-
-	for i := 0; i < 3; i++ {
-		if err := r.send(sock); err != nil {
-			return nil, err
-		}
-
-		tkt, err = r.recvReply(sock, stream)
-
-		if err == nil {
-			tkt.sock = sock
-			tkt.stream = stream
-			return tkt, err
-		} else if e, ok := err.(timeoutError); !stream && ok && e.Timeout() {
-			// Try again for UDP timeouts
-			continue
-		} else {
-			return nil, err
-		}
-	}
-
-	return nil, err
-}
-
-func open(realm string) (net.Conn, bool, error) {
-	proto := "udp"
-	stream := proto == "tcp"
 	_, addrs, err := net.LookupSRV("kerberos", proto, realm)
+
 	if err != nil {
 		_, addrs, err = net.LookupSRV("kerberos-master", proto, realm)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
 
@@ -842,15 +864,96 @@ func open(realm string) (net.Conn, bool, error) {
 	}
 
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	if !stream {
-		// For datagram connections, retry up to three times, then give up
+	if proto == "udp" {
+		// For datagram connections, we retry up to three times, then give up
 		sock.SetReadTimeout(udpReadTimeout)
 	}
 
-	return sock, stream, nil
+	return sock, nil
+}
+
+type timeoutError interface {
+	Timeout() bool
+}
+
+func (r *request) do() (tkt *Ticket, err error) {
+	r.nonce = 0
+
+	if r.proto == "" {
+		r.proto = "udp"
+	}
+
+	// Limit the number of retries before we give up and error out with
+	// the last error
+	for i := 0; i < 3; i++ {
+		if r.sock == nil {
+			if r.sock, err = open(r.proto, r.srealm); err != nil {
+				break
+			}
+		}
+
+		if r.nonce == 0 {
+			// Reduce the entropy of the nonce to 31 bits to ensure it fits in a 4
+			// byte asn.1 value. Active directory seems to need this.
+			if err = binary.Read(rand.Reader, binary.BigEndian, &r.nonce); err != nil {
+				return nil, err
+			}
+			r.nonce >>= 1
+			r.time = time.Now()
+			r.seqnum = nextSequenceNumber()
+		}
+
+		// TODO what error do we get if the tcp socket has been closed underneath us
+		err = r.sendRequest()
+
+		if r.proto == "udp" && err == io.ErrShortWrite {
+			r.nonce = 0
+			r.proto = "tcp"
+			r.sock.Close()
+			r.sock = nil
+			continue
+		} else if err != nil {
+			break
+		}
+
+		tkt, err = r.recvReply()
+
+		if err == nil {
+			return tkt, nil
+
+		} else if e, ok := err.(RemoteError); r.proto == "udp" && ok && e.ErrorCode() == KRB_ERR_RESPONSE_TOO_BIG {
+			r.nonce = 0
+			r.proto = "tcp"
+			r.sock.Close()
+			r.sock = nil
+			continue
+
+		} else if e, ok := err.(timeoutError); r.proto == "udp" && ok && e.Timeout() {
+			// Try again for UDP timeouts.  Reuse nonce, time, and
+			// seqnum values so if the multiple requests end up at
+			// the server, the server will ignore the retries as
+			// replays.
+			continue
+
+		} else {
+			break
+		}
+	}
+
+	// Reset the socket if we got some error (even if we could reuse the
+	// socket in some cases) so that next time we start with a clean
+	// slate.
+	r.proto = ""
+
+	if r.sock != nil {
+		r.sock.Close()
+		r.sock = nil
+	}
+
+	return nil, err
 }
 
 // ResolveService resolves the canonical service principal for a given service
@@ -879,7 +982,7 @@ func ResolveService(service, host string) (string, error) {
 }
 
 type Credential struct {
-	cipher    cipher
+	key       cipher
 	principal principalName
 	realm     string
 	cache     map[string]*Ticket
@@ -894,13 +997,13 @@ type Credential struct {
 // krbtgt/<realm> service ticket.
 func NewCredential(user, realm, password string) *Credential {
 	// Due to use of rc4HmacKey, the key should always be valid
-	cipher, err := loadKey(rc4HmacAlgorithm, rc4HmacKey(password), 0)
+	key, err := loadKey(rc4HmacAlgorithm, rc4HmacKey(password), 0)
 	if err != nil {
 		panic(err)
 	}
 
 	return &Credential{
-		cipher:    cipher,
+		key:       key,
 		principal: principalName{principalNameType, []string{user}},
 		realm:     strings.ToUpper(realm),
 		cache:     make(map[string]*Ticket),
@@ -947,7 +1050,7 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 
 	// AS_REQ login
 	r := request{
-		cipher:  c.cipher,
+		ckey:    c.key,
 		flags:   defaultLoginFlags,
 		till:    time.Now().Add(defaultLoginDuration),
 		crealm:  c.realm,
@@ -956,20 +1059,14 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 		service: principalName{serviceNameType, []string{"krbtgt", c.realm}},
 	}
 
-	sock, stream, err := open(r.srealm)
+	tgt, err := r.do()
 	if err != nil {
 		return nil, "", err
 	}
 
-	tgt, err := r.do(sock, stream)
-	if err != nil {
-		sock.Close()
-		return nil, "", err
-	}
-
-	tgt.sock = sock
-	tgt.stream = stream
-
+	// Save the socket for reuse with TGS requests
+	tgt.sock = r.sock
+	tgt.proto = r.proto
 	c.tgt[c.realm] = tgt
 	c.cache[fmt.Sprintf("krbtgt/%s", c.realm)] = tgt
 
@@ -1031,25 +1128,29 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 		return tkt, nil
 	}
 
-	r := request{
-		client:  tgt.client,
-		crealm:  tgt.crealm,
-		service: splitPrincipal(service),
-		srealm:  tgtrealm,
-		flags:   flags | canonicalize,
-		till:    till,
-		parent:  tgt,
-	}
-
 	// Loop around the ticket granting services that get returned until we
 	// either get our service or we cancel due to a loop in the auth path
 	for i := 0; i < 10; i++ {
-		r.cipher = r.parent.cipher
+		r := request{
+			client:  c.principal,
+			crealm:  c.realm,
+			service: splitPrincipal(service),
+			srealm:  tgtrealm,
+			flags:   flags,
+			till:    till,
+			tgt:     tgt,
+			proto:   tgt.proto,
+			sock:    tgt.sock,
+		}
 
-		tkt, err := r.do(r.parent.sock, r.parent.stream)
+		tkt, err := r.do()
 		if err != nil {
 			return nil, err
 		}
+
+		// r.do() may have closed and opened a new socket
+		tgt.proto = r.proto
+		tgt.sock = r.sock
 
 		tktserv := composePrincipal(tkt.service)
 		c.cache[tktserv] = tkt
@@ -1061,24 +1162,24 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 
 		// If we got a different service, then we may have a ticket to
 		// a next hop ticket granting service.
-		s := tkt.service
-		if s.Type != serviceNameType || len(s.Parts) != 2 || s.Parts[0] != "krbtgt" {
+		if s := tkt.service; s.Type == serviceNameType && len(s.Parts) == 2 && s.Parts[0] == "krbtgt" {
+			tgtrealm = s.Parts[1]
+			tgt = tkt
+			c.tgt[tgtrealm] = tkt
+			continue
+		}
+
+		// We can validly get a different service back if we set the
+		// canon flag
+		if (flags & Canonicalize) != 0 {
+			c.cache[service] = tkt
 			return tkt, nil
 		}
-		r.srealm = s.Parts[1]
-		r.parent = tkt
 
-		tkt.sock, tkt.stream, err = open(r.srealm)
-		if err != nil {
-			return nil, err
-		}
-
-		c.tgt[r.srealm] = tkt
-
-		// Loop around to try our request with the next ticket service
+		return nil, ErrProtocol
 	}
 
-	return nil, ErrProtocol
+	return nil, ErrAuthLoop
 }
 
 func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
@@ -1223,9 +1324,9 @@ func ReadKeytab(file io.Reader) (retcreds []*Credential, err error) {
 			return
 		}
 
-		key := make([]byte, keysize)
+		keydata := make([]byte, keysize)
 		size -= int32(keysize)
-		if _, err = io.ReadFull(file, key); err != nil {
+		if _, err = io.ReadFull(file, keydata); err != nil {
 			return
 		}
 
@@ -1244,13 +1345,13 @@ func ReadKeytab(file io.Reader) (retcreds []*Credential, err error) {
 			keyversion = int(vno32)
 		}
 
-		var cipher cipher
-		if cipher, err = loadKey(int(keytype), key, keyversion); err != nil {
+		var key cipher
+		if key, err = loadKey(int(keytype), keydata, keyversion); err != nil {
 			return
 		}
 
 		cred := &Credential{
-			cipher:    cipher,
+			key:       key,
 			realm:     components[0],
 			principal: principalName{int(nameType), components[1:]},
 			cache:     make(map[string]*Ticket),
