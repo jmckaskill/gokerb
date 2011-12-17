@@ -112,7 +112,7 @@ const (
 const (
 	_ = 1 << iota // reserved
 	useSessionKey
-	mutualRequired
+	MutualAuth
 )
 
 // gss app request flags

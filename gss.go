@@ -97,7 +97,7 @@ type replayKey struct {
 
 func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 	gssflags := byte(0)
-	if (flags & mutualRequired) != 0 {
+	if (flags & MutualAuth) != 0 {
 		gssflags |= gssMutual
 	}
 
@@ -160,7 +160,7 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		return err
 	}
 
-	if (flags & mutualRequired) == 0 {
+	if (flags & MutualAuth) == 0 {
 		return nil
 	}
 
@@ -322,7 +322,7 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 
 	c.replay[rkey] = true
 
-	if (bitStringToFlags(req.Flags) & mutualRequired) == 0 {
+	if (bitStringToFlags(req.Flags) & MutualAuth) == 0 {
 		return nil
 	}
 
