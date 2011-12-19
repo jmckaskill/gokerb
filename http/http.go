@@ -1,6 +1,7 @@
 package khttp
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,51 +14,89 @@ import (
 
 type Transport struct {
 	Credential *kerb.Credential
-	Next http.RoundTripper
+	Next       http.RoundTripper
 }
 
 var TicketLifetime = time.Hour * 8
 var TicketFlags = 0
 
 var (
-	ErrNoAuth = errors.New("kerb http: no www-authorization")
+	ErrNoAuth       = errors.New("kerb http: no or invalid authorization header")
+	negotiate       = "Negotiate "
+	basic           = "Basic "
+	authorization   = "Authorization"
+	wwwAuthenticate = "Www-Authenticate"
 )
 
-type gss struct {
-	togss chan string
-	fromgss chan string
-	done chan error
+type ErrInvalidUser string
+
+func (s ErrInvalidUser) Error() string {
+	return fmt.Sprintf("kerb: invalid user '%s'", string(s))
 }
 
-var negHeader = "Negotiate "
+type gss struct {
+	// Warning: the use of []byte rather than string here only works
+	// because the gss algorithms don't modify the buffers they write
+	// after calling Write
+	togss    chan []byte
+	fromgss  chan []byte
+	done     chan error
+	username string
+	realm    string
+	buf      []byte
+}
+
+func splitAuth(h string) (string, []byte, error) {
+	i := strings.Index(h, " ")
+	if i < 0 {
+		return "", nil, ErrNoAuth
+	}
+
+	data, err := base64.StdEncoding.DecodeString(h[i+1:])
+	return h[:i+1], data, err
+}
 
 func (g *gss) Read(data []byte) (int, error) {
-	enc, ok := <-g.togss
-	if !ok {
-		return 0, io.EOF
+	if len(g.buf) == 0 {
+		ok := false
+		if g.togss != nil {
+			g.buf, ok = <-g.togss
+		}
+		if !ok {
+			g.togss = nil
+			return 0, io.EOF
+		}
 	}
 
-	if !strings.HasPrefix(enc, negHeader) {
-		return 0, kerb.ErrProtocol
-	}
-
-	return base64.StdEncoding.Decode(data, []byte(enc[len(negHeader):]))
+	n := copy(data, g.buf)
+	g.buf = g.buf[n:]
+	return n, nil
 }
 
 func (g *gss) Write(data []byte) (int, error) {
-	enc := make([]byte, len(negHeader) + base64.StdEncoding.EncodedLen(len(data)))
-	copy(enc, negHeader)
-	base64.StdEncoding.Encode(enc[len(negHeader):], data)
-	g.fromgss <- string(enc)
+	g.fromgss <- data
+	// For both the connect and accept algorithms we should always send at most one PDU
+	close(g.fromgss)
+	g.fromgss = nil
 	return len(data), nil
 }
 
 func (g *gss) connect(t *kerb.Ticket) {
 	g.done <- t.Connect(g, kerb.MutualAuth)
+	if g.fromgss != nil {
+		close(g.fromgss)
+	}
 }
 
-func (g *gss) accept(c *kerb.Credential) {
-	g.done <- c.Accept(g)
+func acceptThread(c *kerb.Credential, ch chan *gss) {
+	var err error
+	for g := range ch {
+		g.username, g.realm, err = c.Accept(g)
+		if g.fromgss != nil {
+			close(g.fromgss)
+		}
+		g.done <- err
+	}
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -71,154 +110,149 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	g := gss{make(chan string), make(chan string), make(chan error, 1)}
+	// Make togss async so the send doesn't block when the connector
+	// doesn't want the reply. Make done async, so the connect thread will
+	// finish if we error out early and don't service it.
+	g := &gss{fromgss: make(chan []byte), togss: make(chan []byte, 1), done: make(chan error, 1)}
 	go g.connect(tkt)
+	defer close(g.togss)
 
 	// Get the request auth header from the connect thread
 	select {
 	case auth := <-g.fromgss:
-		req.Header.Set("WWW-Authorization", auth)
+		req.Header.Set(wwwAuthenticate, negotiate+base64.StdEncoding.EncodeToString(auth))
 	case err := <-g.done:
 		return nil, err
 	}
 
 	resp, err := t.Next.RoundTrip(req)
 	if err != nil {
-		// Make sure the connect thread finishes
-		close(g.togss)
 		return nil, err
 	}
 
-	// Try and send the reply auth header to the connect thread
-	select {
-	case g.togss <- req.Header.Get("WWW-Authorization"):
-	case err := <-g.done:
-		return nil, err
+	if auth, data, err := splitAuth(resp.Header.Get(wwwAuthenticate)); auth == negotiate && err == nil {
+		g.togss <- data
 	}
 
-	// Finally get the final result of the kerberos connect
-	close(g.togss)
 	return resp, <-g.done
 }
 
-type Authenticator struct {
-	BasicAuthRealm string
-	Credential *kerb.Credential
+type UserLookup func(username string) (user, realm string, err error)
 
-	// List of windows 2000 style realm aliases. This allows use to login
-	// with Domain\User. The key is the alias, value is the kerberos realm.
-	Realms map[string]string
+type Authenticator struct {
+	BasicLookup UserLookup
+	BasicRealm  string
+	Negotiate   bool
+	accept      chan *gss
+	cred        *kerb.Credential
 }
 
-func (a *Authenticator) writeFailure(w http.ResponseWriter, failed string) {
-	if failed != "Negotiate" && a.Credential != nil {
-		w.Header().Add("WWW-Authorization", "Negotiate")
+func NewAuthenticator(c *kerb.Credential) *Authenticator {
+	a := &Authenticator{
+		accept:    make(chan *gss),
+		cred:      c,
+		Negotiate: false,
 	}
 
-	if a.BasicAuthRealm != "" {
-		w.Header().Add("WWW-Authorization", fmt.Sprintf("Basic realm \"%a\"", a.BasicAuthRealm))
+	go acceptThread(c, a.accept)
+	return a
+}
+
+func (a *Authenticator) Close() {
+	close(a.accept)
+}
+
+func (a *Authenticator) fail(w http.ResponseWriter, r *http.Request, err error) (user, realm string, rerr error) {
+	// Filter out negotiate on failure so that the user can retry with basic auth
+	if a.Negotiate && !strings.HasPrefix(r.Header.Get(authorization), negotiate) {
+		w.Header().Add(wwwAuthenticate, negotiate)
+	}
+
+	if a.BasicLookup != nil {
+		w.Header().Add(wwwAuthenticate, fmt.Sprintf("Basic realm=\"%s\"", a.BasicRealm))
 	}
 
 	w.WriteHeader(http.StatusUnauthorized)
+	return "", "", err
 }
 
-func (a *Authenticator) doNegotiate(w http.ResponseWriter, r *http.Request, auth string) error {
-	g := gss{make(chan string), make(chan string), make(chan error, 1)}
-	go g.accept(a.Credential)
+func (a *Authenticator) doNegotiate(w http.ResponseWriter, r *http.Request, auth []byte) (user, realm string, err error) {
+	g := &gss{fromgss: make(chan []byte), done: make(chan error), buf: auth}
+	a.accept <- g
 
-	g.togss <- auth
-	close(g.togss)
+	reply, rok := <-g.fromgss
 
-	var err error
-	select {
-	case reply := <-g.fromgss:
-		err = <-g.done
-		if err != nil && reply != "" {
-			w.Header().Add("WWW-Authorization", reply)
-		}
-	case err = <-g.done:
+	if err := <-g.done; err != nil {
+		return a.fail(w, r, err)
 	}
 
-	if err != nil {
-		a.writeFailure(w, "Negotiate")
-		return err
+	if rok {
+		// The auth succeeded and requested that the server authenticate back
+		w.Header().Add(wwwAuthenticate, negotiate+base64.StdEncoding.EncodeToString(reply))
 	}
 
-	return nil
+	return g.username, g.realm, nil
 }
 
-func (a *Authenticator) splitBasicAuth(auth string) (user string, realm string, pass string, err error) {
-	i := strings.Index(auth, ":")
+func (a *Authenticator) doBasicAuth(w http.ResponseWriter, r *http.Request, auth []byte) (user, realm string, err error) {
+	i := bytes.IndexRune(auth, ':')
 	if i < 0 {
-		err = ErrNoAuth
-		return
+		return a.fail(w, r, ErrNoAuth)
 	}
 
-	user = auth[:i]
-	pass = auth[i+1:]
-
-	if i := strings.Index(user, "@"); i >= 0 {
-		realm = user[i+1:]
-		user = user[:i]
-		return
+	user, realm, err = a.BasicLookup(string(auth[:i]))
+	if err != nil {
+		return a.fail(w, r, err)
+	} else if user == "" || realm == "" {
+		return a.fail(w, r, ErrInvalidUser(string(auth[:i])))
 	}
 
-	if i := strings.Index(user, "\\"); i >= 0 {
-		realm = user[:i]
-		user = user[i+1:]
-	} else if i := strings.Index(user, "/"); i >= 0 {
-		realm = user[:i]
-		user = user[i+1:]
+	cred := kerb.NewCredential(user, realm, string(auth[i+1:]))
+	tkt, err := cred.GetTicket(a.cred.Principal(), a.cred.Realm(), time.Now().Add(TicketLifetime), TicketFlags)
+	if err != nil {
+		return a.fail(w, r, err)
 	}
 
-	realm, ok := a.Realms[realm]
-	if !ok {
-		err = ErrNoAuth
-		return
+	// We now run the accept and connect algorithms in two threads and
+	// join them directly up. This has the effect of double checking the
+	// ticket returned by the dc. Make togss and fromgss buffered in case
+	// one of the threads errors out before servicing its input.
+	gc := &gss{fromgss: make(chan []byte, 1), togss: make(chan []byte, 1), done: make(chan error)}
+	ga := &gss{togss: gc.fromgss, fromgss: gc.togss, done: gc.done}
+
+	go gc.connect(tkt)
+	a.accept <- ga
+	errc := <-gc.done
+	erra := <-ga.done
+
+	if errc != nil {
+		return a.fail(w, r, errc)
 	}
 
-	return
+	if erra != nil {
+		return a.fail(w, r, erra)
+	}
+
+	return user, realm, nil
 }
 
-func (a *Authenticator) doBasicAuth(w http.ResponseWriter, r *http.Request, auth string) error {
-	dec, err := base64.StdEncoding.DecodeString(auth[len("Basic "):])
-	if err != nil {
-		a.writeFailure(w, "Basic")
-		return err
-	}
-
-	user, realm, pass, err := a.splitBasicAuth(string(dec))
-	if err != nil {
-		a.writeFailure(w, "Basic")
-		return err
-	}
-
-	realm = strings.ToUpper(realm)
-
-	c := kerb.NewCredential(user, realm, pass)
-	_, err = c.GetTicket("krbtgt/" + realm, realm, time.Now().Add(TicketLifetime), TicketFlags)
+func (a *Authenticator) Authenticate(w http.ResponseWriter, r *http.Request) (user, realm string, err error) {
+	auth, data, err := splitAuth(r.Header.Get(authorization))
 
 	if err != nil {
-		a.writeFailure(w, "Basic")
-		return err
+		return a.fail(w, r, err)
 	}
 
-	return nil
-}
-
-func (a *Authenticator) Authenticate(w http.ResponseWriter, r *http.Request) error {
-	auth := r.Header.Get("WWW-Authorization")
+	// Remove the auth header so its not seen by reverse proxies, logs, etc
+	r.Header.Del(authorization)
 
 	switch {
-	case a.Credential != nil && strings.HasPrefix(auth, "Negotiate "):
-		return a.doNegotiate(w, r, auth)
+	case a.Negotiate && auth == negotiate:
+		return a.doNegotiate(w, r, data)
 
-	case a.BasicAuthRealm != "" && strings.HasPrefix(auth, "Basic "):
-		return a.doBasicAuth(w, r, auth)
+	case a.BasicLookup != nil && auth == basic:
+		return a.doBasicAuth(w, r, data)
 	}
 
-	a.writeFailure(w, "")
-	return ErrNoAuth
+	return a.fail(w, r, ErrNoAuth)
 }
-
-

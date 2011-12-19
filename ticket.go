@@ -86,7 +86,7 @@ func (r *request) sendRequest() error {
 			Client:       r.client,
 			Microseconds: r.seqnum % 1000000,
 			Time:         r.time,
-			Checksum:     r.tgt.key.checksum(bodyData, paTgsRequestChecksumKey),
+			Checksum:     r.tgt.key.Checksum(bodyData, paTgsRequestChecksumKey),
 		}
 
 		authData, err := asn1.MarshalWithParams(auth, authenticatorParam)
@@ -99,7 +99,7 @@ func (r *request) sendRequest() error {
 			MsgType:       appRequestType,
 			Flags:         flagsToBitString(0),
 			Ticket:        asn1.RawValue{FullBytes: r.tgt.ticket},
-			Authenticator: r.tgt.key.encrypt(authData, paTgsRequestKey),
+			Authenticator: r.tgt.key.Encrypt(authData, paTgsRequestKey),
 		}
 
 		appData, err := asn1.MarshalWithParams(app, appRequestParam)
@@ -120,7 +120,7 @@ func (r *request) sendRequest() error {
 			return err
 		}
 
-		enc, err := asn1.Marshal(r.ckey.encrypt(ts, paEncryptedTimestampKey))
+		enc, err := asn1.Marshal(r.ckey.Encrypt(ts, paEncryptedTimestampKey))
 		if err != nil {
 			return err
 		}
@@ -235,10 +235,29 @@ func (r *request) recvReply() (*Ticket, error) {
 		return nil, ErrProtocol
 	}
 
+	// TGS doesn't use key versions as its using session keys
+	if r.tgt == nil {
+		if rep.Encrypted.KeyVersion == 0 {
+			return nil, ErrProtocol
+		}
+
+		kvno, _ := key.Key()
+
+		// If we created the key from a keytab then we know the
+		// version number, if we created it from plaintext then we use
+		// the reply to find the key version
+
+		if kvno == 0 {
+			key.SetKeyVersion(rep.Encrypted.KeyVersion)
+		} else if kvno != rep.Encrypted.KeyVersion {
+			return nil, ErrProtocol
+		}
+	}
+
 	// Decode encrypted part
 
 	enc := encryptedKdcReply{}
-	if edata, err := key.decrypt(rep.Encrypted, usage); err != nil {
+	if edata, err := key.Decrypt(rep.Encrypted, usage); err != nil {
 		return nil, err
 	} else if _, err := asn1.UnmarshalWithParams(edata, &enc, encparam); err != nil {
 		return nil, err
@@ -250,19 +269,11 @@ func (r *request) recvReply() (*Ticket, error) {
 		return nil, ErrProtocol
 	}
 
-	// Decode ticket
-
-	tkt := ticket{}
-	if _, err := asn1.UnmarshalWithParams(rep.Ticket.FullBytes, &tkt, ticketParam); err != nil {
-		return nil, err
-	}
-
-	key, err := loadKey(enc.Key.Algorithm, enc.Key.Key, tkt.KeyVersion)
+	key, err := loadKey(enc.Key.Algorithm, enc.Key.Key, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO use enc.Flags to mask out flags which the server refused
 	return &Ticket{
 		client:    r.client,
 		crealm:    r.crealm,
@@ -271,7 +282,9 @@ func (r *request) recvReply() (*Ticket, error) {
 		ticket:    rep.Ticket.FullBytes,
 		till:      enc.Till,
 		renewTill: enc.RenewTill,
-		flags:     r.flags,
+		authTime:  enc.AuthTime,
+		startTime: enc.From,
+		flags:     bitStringToFlags(enc.Flags),
 		key:       key,
 	}, nil
 }
@@ -284,6 +297,8 @@ type Ticket struct {
 	ticket    []byte
 	till      time.Time
 	renewTill time.Time
+	authTime  time.Time
+	startTime time.Time
 	flags     int
 	key       cipher
 	sock      net.Conn

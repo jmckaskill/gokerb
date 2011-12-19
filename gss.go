@@ -53,15 +53,15 @@ func decodeGssWrapper(data []byte) (oid asn1.ObjectIdentifier, idata []byte, err
 
 	switch {
 	case isz == 0x84:
-		isz = int(data[0]<<24) + int(data[1]<<16) + int(data[2]<<8) + int(data[3])
+		isz = int(data[0])<<24 + int(data[1])<<16 + int(data[2])<<8 + int(data[3])
 		data = data[4:]
 
 	case isz == 0x83:
-		isz = int(data[0]<<16) + int(data[1]<<8) + int(data[2])
+		isz = int(data[0])<<16 + int(data[1])<<8 + int(data[2])
 		data = data[3:]
 
 	case isz == 0x82:
-		isz = int(data[0]<<8) + int(data[1])
+		isz = int(data[0])<<8 + int(data[1])
 		data = data[2:]
 
 	case isz == 0x81:
@@ -142,7 +142,7 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		MsgType:       appRequestType,
 		Flags:         flagsToBitString(flags),
 		Ticket:        asn1.RawValue{FullBytes: t.ticket},
-		Authenticator: t.key.encrypt(authdata, appRequestAuthKey),
+		Authenticator: t.key.Encrypt(authdata, appRequestAuthKey),
 	}
 
 	reqdata, err := asn1.MarshalWithParams(req, appRequestParam)
@@ -150,7 +150,7 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		return err
 	}
 
-	reqdata = append([]byte{byte(appRequestType >> 8), byte(appRequestType)}, reqdata...)
+	reqdata = append([]byte{(gssAppRequest >> 8) & 0xFF, gssAppRequest & 0xFF}, reqdata...)
 	gssdata, err := encodeGssWrapper(gssKrb5Oid, reqdata)
 	if err != nil {
 		return err
@@ -176,7 +176,23 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		return err
 	}
 
-	if !oid.Equal(gssKrb5Oid) || len(repdata) < 2 || binary.BigEndian.Uint16(repdata[:2]) != appReplyType {
+	if !oid.Equal(gssKrb5Oid) || len(repdata) < 2 {
+		return ErrProtocol
+	}
+
+	gsstype := binary.BigEndian.Uint16(repdata[:2])
+
+	switch gsstype {
+	case gssAppError:
+		errmsg := errorMessage{}
+		if _, err := asn1.UnmarshalWithParams(repdata[2:], &errmsg, errorParam); err != nil {
+			return err
+		}
+		return RemoteError{&errmsg}
+
+	case gssAppReply:
+		// continue below
+	default:
 		return ErrProtocol
 	}
 
@@ -189,7 +205,7 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 		return ErrProtocol
 	}
 
-	edata, err := t.key.decrypt(rep.Encrypted, appReplyEncryptedKey)
+	edata, err := t.key.Decrypt(rep.Encrypted, appReplyEncryptedKey)
 	if err != nil {
 		return err
 	}
@@ -206,93 +222,115 @@ func (t *Ticket) Connect(sock io.ReadWriter, flags int) error {
 	return nil
 }
 
-func (c *Credential) Accept(rw io.ReadWriter) error {
+func (c *Credential) Accept(rw io.ReadWriter) (username string, realm string, rerr error) {
 	// TODO send error replies
 	reqbuf := bytes.NewBuffer(nil)
 	if _, err := io.Copy(reqbuf, rw); err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	oid, reqdata, err := decodeGssWrapper(reqbuf.Bytes())
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	spnego := oid.Equal(gssSpnegoOid)
 	if spnego {
 		neg := negTokenInit{}
 		if _, err := asn1.UnmarshalWithParams(reqdata, &neg, negTokenInitParam); err != nil {
-			return err
+			rerr = err
+			return
 		}
 
 		oid, reqdata, err = decodeGssWrapper(neg.Token)
 		if err != nil {
-			return err
+			rerr = err
+			return
 		}
 	}
 
 	if !oid.Equal(gssKrb5Oid) && !oid.Equal(gssMsKrb5Oid) {
-		return ErrProtocol
+		rerr = ErrProtocol
+		return
+	}
+
+	if len(reqdata) < 2 || binary.BigEndian.Uint16(reqdata[:2]) != gssAppRequest {
+		rerr = ErrProtocol
+		return
 	}
 
 	req := appRequest{}
-	if _, err := asn1.UnmarshalWithParams(reqdata, &req, appRequestParam); err != nil {
-		return err
+	if _, err := asn1.UnmarshalWithParams(reqdata[2:], &req, appRequestParam); err != nil {
+		rerr = err
+		return
 	}
 
 	if req.ProtoVersion != kerberosVersion || req.MsgType != appRequestType {
-		return ErrProtocol
+		rerr = ErrProtocol
+		return
 	}
 
 	// Check the ticket
 
 	tkt := ticket{}
 	if _, err := asn1.UnmarshalWithParams(req.Ticket.FullBytes, &tkt, ticketParam); err != nil {
-		return err
+		rerr = err
+		return
 	}
 
-	if tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
-		return ErrInvalidTicket
+	if tkt.ProtoVersion != kerberosVersion || tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
+		rerr = ErrInvalidTicket
+		return
 	}
 
-	etktdata, err := c.key.decrypt(tkt.Encrypted, ticketKey)
+	etktdata, err := c.key.Decrypt(tkt.Encrypted, ticketKey)
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	etkt := encryptedTicket{}
 	if _, err := asn1.UnmarshalWithParams(etktdata, &etkt, encTicketParam); err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	now := time.Now()
 	if (etkt.From != time.Time{} && now.Before(etkt.From)) || now.After(etkt.Till) {
-		return ErrInvalidTicket
+		rerr = ErrInvalidTicket
+		return
 	}
 
-	tkey, err := loadKey(etkt.Key.Algorithm, etkt.Key.Key, tkt.KeyVersion)
+	tkey, err := loadKey(etkt.Key.Algorithm, etkt.Key.Key, 0)
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	// Check the authenticator
 
-	authdata, err := tkey.decrypt(req.Authenticator, appRequestAuthKey)
+	authdata, err := tkey.Decrypt(req.Authenticator, appRequestAuthKey)
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	auth := authenticator{}
 	if _, err := asn1.UnmarshalWithParams(authdata, &auth, authenticatorParam); err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	if auth.ProtoVersion != kerberosVersion || auth.ClientRealm != etkt.ClientRealm || !nameEquals(auth.Client, etkt.Client) {
-		return ErrProtocol
+		rerr = ErrProtocol
+		return
 	}
 
 	if math.Abs(float64(now.Sub(auth.Time))) > float64(time.Minute*5) {
-		return ErrProtocol
+		rerr = ErrProtocol
+		return
 	}
 
 	// Now check for replays
@@ -305,12 +343,17 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 		sequenceNumber: auth.SequenceNumber,
 	}
 
-	if _, ok := c.replay[rkey]; ok {
-		return ErrProtocol
+	if c.replay == nil {
+		c.replay = make(map[replayKey]bool)
+		c.lastReplayPurge = now
 	}
 
-	// Check for an empty replay cache so that we can initialise c.lastReplayPurge
-	if len(c.replay) == 0 || now.Sub(c.lastReplayPurge) > time.Minute*10 {
+	if _, ok := c.replay[rkey]; ok {
+		rerr = ErrProtocol
+		return
+	}
+
+	if now.Sub(c.lastReplayPurge) > time.Minute*10 {
 		for rkey := range c.replay {
 			if now.Sub(rkey.time) > time.Minute*10 {
 				delete(c.replay, rkey)
@@ -323,7 +366,7 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 	c.replay[rkey] = true
 
 	if (bitStringToFlags(req.Flags) & MutualAuth) == 0 {
-		return nil
+		return composePrincipal(etkt.Client), etkt.ClientRealm, nil
 	}
 
 	// Now send the reply
@@ -336,24 +379,27 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 
 	edata, err := asn1.MarshalWithParams(enc, encAppReplyParam)
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	rep := appReply{
 		ProtoVersion: kerberosVersion,
 		MsgType:      appReplyType,
-		Encrypted:    tkey.encrypt(edata, appReplyEncryptedKey),
+		Encrypted:    tkey.Encrypt(edata, appReplyEncryptedKey),
 	}
 
 	repdata, err := asn1.MarshalWithParams(rep, appReplyParam)
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
-	repdata = append([]byte{byte(appReplyType >> 8), byte(appReplyType)}, repdata...)
+	repdata = append([]byte{(gssAppReply >> 8) & 0xFF, gssAppReply & 0xFF}, repdata...)
 	gssrep, err := encodeGssWrapper(oid, repdata)
 	if err != nil {
-		return err
+		rerr = err
+		return
 	}
 
 	if spnego {
@@ -365,18 +411,21 @@ func (c *Credential) Accept(rw io.ReadWriter) error {
 
 		repdata, err := asn1.MarshalWithParams(srep, negTokenReplyParam)
 		if err != nil {
-			return err
+			rerr = err
+			return
 		}
 
 		gssrep, err = encodeGssWrapper(gssSpnegoOid, repdata)
 		if err != nil {
-			return err
+			rerr = err
+			return
 		}
 	}
 
 	if _, err := rw.Write(gssrep); err != nil {
-		return err
+		rerr = err
+		return
 	}
 
-	return nil
+	return composePrincipal(etkt.Client), etkt.ClientRealm, nil
 }

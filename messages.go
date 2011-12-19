@@ -145,7 +145,8 @@ const (
 // Name types
 const (
 	principalNameType = 1 + iota
-	serviceNameType
+	serviceInstanceType
+	serviceHostType
 )
 
 // Preauth types
@@ -191,6 +192,7 @@ var (
 	ErrProtocol      = errors.New("kerb: protocol error")
 	ErrAuthLoop      = errors.New("kerb: auth loop")
 	ErrInvalidTicket = errors.New("kerb: invalid or expired ticket")
+	ErrPassword      = errors.New("kerb: can't renew the main krbtgt ticket as the password is unknown")
 
 	supportedAlgorithms = []int{rc4HmacAlgorithm}
 
@@ -209,7 +211,7 @@ var (
 	errorParam         = "application,explicit,tag:30"
 
 	negTokenInitParam  = "explicit,tag:0"
-	negTokenReplyParam = "explicit,tag:0"
+	negTokenReplyParam = "explicit,tag:1"
 
 	gssKrb5Oid    = asn1.ObjectIdentifier([]int{1, 2, 840, 113554, 1, 2, 2})
 	gssOldKrb5Oid = asn1.ObjectIdentifier([]int{1, 3, 5, 1, 5, 2})
@@ -226,6 +228,10 @@ const (
 	spnegoIncomplete
 	spnegoReject
 	spnegoRequestMIC
+
+	gssAppRequest = 0x0100
+	gssAppReply   = 0x0200
+	gssAppError   = 0x0300
 )
 
 type principalName struct {
@@ -245,10 +251,10 @@ type encryptionKey struct {
 }
 
 type ticket struct {
-	KeyVersion int           `asn1:"explicit,tag:0"`
-	Realm      string        `asn1:"general,explicit,tag:1"`
-	Service    principalName `asn1:"explicit,tag:2"`
-	Encrypted  encryptedData `asn1:"explicit,tag:3"`
+	ProtoVersion int           `asn1:"explicit,tag:0"`
+	Realm        string        `asn1:"general,explicit,tag:1"`
+	Service      principalName `asn1:"explicit,tag:2"`
+	Encrypted    encryptedData `asn1:"explicit,tag:3"`
 }
 
 type transitedEncoding struct {
@@ -283,7 +289,7 @@ type encryptedTimestamp struct {
 }
 
 type encryptedTicket struct {
-	Flags        int               `asn1:"explicit,tag:0"`
+	Flags        asn1.BitString    `asn1:"explicit,tag:0"`
 	Key          encryptionKey     `asn1:"explicit,tag:1"`
 	ClientRealm  string            `asn1:"general,explicit,tag:2"`
 	Client       principalName     `asn1:"explicit,tag:3"`
@@ -409,7 +415,9 @@ type negTokenReply struct {
 }
 
 func nameEquals(a, b principalName) bool {
-	if a.Type != b.Type || len(a.Parts) != len(b.Parts) {
+	// Note two principals with different types but the same components
+	// are considered equivalent
+	if len(a.Parts) != len(b.Parts) {
 		return false
 	}
 
@@ -425,19 +433,11 @@ func nameEquals(a, b principalName) bool {
 // splitPrincipal splits the principal (sans realm) in p into the split on
 // wire format.
 func splitPrincipal(p string) (r principalName) {
-	parts := strings.Split(p, "/")
-
-	switch len(parts) {
-	case 1:
-		r.Type = principalNameType
-		r.Parts = parts
-	case 2:
-		r.Type = serviceNameType
-		r.Parts = parts
-	default:
-		panic("invalid principal")
-	}
-
+	// Per the RFC: When a name implies no information other than its
+	// uniqueness at a particular time, the name type PRINCIPAL SHOULD be
+	// used.
+	r.Type = principalNameType
+	r.Parts = strings.Split(p, "/")
 	return
 }
 

@@ -13,9 +13,11 @@ import (
 )
 
 type cipher interface {
-	encrypt(d []byte, usage int) encryptedData
-	decrypt(d encryptedData, usage int) ([]byte, error)
-	checksum(d []byte, usage int) checksumData
+	Encrypt(d []byte, usage int) encryptedData
+	Decrypt(d encryptedData, usage int) ([]byte, error)
+	Checksum(d []byte, usage int) checksumData
+	SetKeyVersion(kvno int)
+	Key() (kvno int, key encryptionKey)
 }
 
 type rc4HmacCipher struct {
@@ -52,7 +54,18 @@ func rc4HmacUsage(usage int) uint32 {
 	return uint32(usage)
 }
 
-func (c *rc4HmacCipher) checksum(data []byte, usage int) checksumData {
+func (c *rc4HmacCipher) SetKeyVersion(kvno int) {
+	c.kvno = kvno
+}
+
+func (c *rc4HmacCipher) Key() (int, encryptionKey) {
+	return c.kvno, encryptionKey{
+		Algorithm: rc4HmacAlgorithm,
+		Key:       c.key,
+	}
+}
+
+func (c *rc4HmacCipher) Checksum(data []byte, usage int) checksumData {
 	// TODO: replace with RC4-HMAC checksum algorithm. For now we are
 	// using the unkeyed RSA-MD5 checksum algorithm
 	h := md5.New()
@@ -63,7 +76,7 @@ func (c *rc4HmacCipher) checksum(data []byte, usage int) checksumData {
 	}
 }
 
-func (c *rc4HmacCipher) encrypt(data []byte, usage int) encryptedData {
+func (c *rc4HmacCipher) Encrypt(data []byte, usage int) encryptedData {
 	// Create the output vector, layout is 0-15 checksum, 16-23 random data, 24- actual data
 	out := make([]byte, len(data)+24)
 	io.ReadFull(rand.Reader, out[16:24])
@@ -97,8 +110,8 @@ func (c *rc4HmacCipher) encrypt(data []byte, usage int) encryptedData {
 	}
 }
 
-func (c *rc4HmacCipher) decrypt(d encryptedData, usage int) ([]byte, error) {
-	if d.Algorithm != rc4HmacAlgorithm || (d.KeyVersion != 0 && c.kvno != 0 && d.KeyVersion != c.kvno) || len(d.Data) < 24 {
+func (c *rc4HmacCipher) Decrypt(d encryptedData, usage int) ([]byte, error) {
+	if d.Algorithm != rc4HmacAlgorithm || (c.kvno != 0 && d.KeyVersion != c.kvno) || len(d.Data) < 24 {
 		return nil, ErrProtocol
 	}
 

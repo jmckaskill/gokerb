@@ -59,8 +59,6 @@ func NewCredential(user, realm, password string) *Credential {
 		key:       key,
 		principal: principalName{principalNameType, []string{user}},
 		realm:     strings.ToUpper(realm),
-		cache:     make(map[string]*Ticket),
-		tgt:       make(map[string]*Ticket),
 	}
 }
 
@@ -101,6 +99,11 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 		return tgt, c.realm, nil
 	}
 
+	// Credentials created with ReadCredentialCache don't know the client password
+	if c.key == nil {
+		return nil, "", ErrPassword
+	}
+
 	// AS_REQ login
 	r := request{
 		ckey:    c.key,
@@ -109,7 +112,7 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 		crealm:  c.realm,
 		srealm:  c.realm,
 		client:  c.principal,
-		service: principalName{serviceNameType, []string{"krbtgt", c.realm}},
+		service: principalName{serviceInstanceType, []string{"krbtgt", c.realm}},
 	}
 
 	tgt, err := r.do()
@@ -121,9 +124,13 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 	tgt.sock = r.sock
 	tgt.proto = r.proto
 	c.tgt[c.realm] = tgt
-	c.cache[fmt.Sprintf("krbtgt/%s", c.realm)] = tgt
+	c.cache["krbtgt/"+c.realm] = tgt
 
 	return tgt, c.realm, nil
+}
+
+func (c *Credential) GetLoginTicket(till time.Time, flags int) (*Ticket, error) {
+	return c.GetTicket("krbtgt/"+c.realm, c.realm, till, flags)
 }
 
 // GetTicket returns a valid ticket for the given service and realm.
@@ -164,6 +171,11 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 		// Realms are case-insensitive, but kerberos is
 		// case-sensitive. The RFC recommends always using upper case.
 		realm = strings.ToUpper(realm)
+	}
+
+	if c.cache == nil {
+		c.cache = make(map[string]*Ticket)
+		c.tgt = make(map[string]*Ticket)
 	}
 
 	if tkt := c.lookupCache(c.cache, service, ctill, flags); tkt != nil {
@@ -215,7 +227,7 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 
 		// If we got a different service, then we may have a ticket to
 		// a next hop ticket granting service.
-		if s := tkt.service; s.Type == serviceNameType && len(s.Parts) == 2 && s.Parts[0] == "krbtgt" {
+		if s := tkt.service; len(s.Parts) == 2 && s.Parts[0] == "krbtgt" {
 			tgtrealm = s.Parts[1]
 			tgt = tkt
 			c.tgt[tgtrealm] = tkt
