@@ -34,16 +34,14 @@ func (s ErrInvalidUser) Error() string {
 	return fmt.Sprintf("kerb: invalid user '%s'", string(s))
 }
 
-type gss struct {
-	// Warning: the use of []byte rather than string here only works
-	// because the gss algorithms don't modify the buffers they write
-	// after calling Write
-	togss    chan []byte
-	fromgss  chan []byte
-	done     chan error
-	username string
-	realm    string
-	buf      []byte
+type readwriter struct {
+	io.Reader
+	io.Writer
+}
+
+func connectThread(t *kerb.Ticket, rw readwriter, done chan error) {
+	_, err := t.Connect(rw, 0)
+	done <- err
 }
 
 func splitAuth(h string) (string, []byte, error) {
@@ -54,49 +52,6 @@ func splitAuth(h string) (string, []byte, error) {
 
 	data, err := base64.StdEncoding.DecodeString(h[i+1:])
 	return h[:i+1], data, err
-}
-
-func (g *gss) Read(data []byte) (int, error) {
-	if len(g.buf) == 0 {
-		ok := false
-		if g.togss != nil {
-			g.buf, ok = <-g.togss
-		}
-		if !ok {
-			g.togss = nil
-			return 0, io.EOF
-		}
-	}
-
-	n := copy(data, g.buf)
-	g.buf = g.buf[n:]
-	return n, nil
-}
-
-func (g *gss) Write(data []byte) (int, error) {
-	g.fromgss <- data
-	// For both the connect and accept algorithms we should always send at most one PDU
-	close(g.fromgss)
-	g.fromgss = nil
-	return len(data), nil
-}
-
-func (g *gss) connect(t *kerb.Ticket) {
-	g.done <- t.Connect(g, kerb.MutualAuth)
-	if g.fromgss != nil {
-		close(g.fromgss)
-	}
-}
-
-func acceptThread(c *kerb.Credential, ch chan *gss) {
-	var err error
-	for g := range ch {
-		g.username, g.realm, err = c.Accept(g)
-		if g.fromgss != nil {
-			close(g.fromgss)
-		}
-		g.done <- err
-	}
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -110,20 +65,20 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	// Make togss async so the send doesn't block when the connector
-	// doesn't want the reply. Make done async, so the connect thread will
-	// finish if we error out early and don't service it.
-	g := &gss{fromgss: make(chan []byte), togss: make(chan []byte, 1), done: make(chan error, 1)}
-	go g.connect(tkt)
-	defer close(g.togss)
+	rreq, wreq := io.Pipe()
+	rrep, wrep := io.Pipe()
+	done := make(chan error, 1)
+	go connectThread(tkt, readwriter{rrep, wreq}, done)
+	defer wrep.Close()
 
 	// Get the request auth header from the connect thread
-	select {
-	case auth := <-g.fromgss:
-		req.Header.Set(wwwAuthenticate, negotiate+base64.StdEncoding.EncodeToString(auth))
-	case err := <-g.done:
+	breq := [4096]byte{}
+	n, err := rreq.Read(breq[:])
+	if err != nil {
 		return nil, err
 	}
+
+	req.Header.Set(wwwAuthenticate, negotiate+base64.StdEncoding.EncodeToString(breq[:n]))
 
 	resp, err := t.Next.RoundTrip(req)
 	if err != nil {
@@ -131,35 +86,36 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	if auth, data, err := splitAuth(resp.Header.Get(wwwAuthenticate)); auth == negotiate && err == nil {
-		g.togss <- data
+		wrep.Write(data)
 	}
 
-	return resp, <-g.done
+	if err := <-done; err != nil {
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 type UserLookup func(username string) (user, realm string, err error)
 
-type Authenticator struct {
+type AuthConfig struct {
 	BasicLookup UserLookup
 	BasicRealm  string
 	Negotiate   bool
-	accept      chan *gss
+}
+
+type Authenticator struct {
+	AuthConfig
 	cred        *kerb.Credential
 }
 
-func NewAuthenticator(c *kerb.Credential) *Authenticator {
+func NewAuthenticator(c *kerb.Credential, cfg *AuthConfig) *Authenticator {
 	a := &Authenticator{
-		accept:    make(chan *gss),
+		AuthConfig: *cfg,
 		cred:      c,
-		Negotiate: false,
 	}
 
-	go acceptThread(c, a.accept)
 	return a
-}
-
-func (a *Authenticator) Close() {
-	close(a.accept)
 }
 
 func (a *Authenticator) fail(w http.ResponseWriter, r *http.Request, err error) (user, realm string, rerr error) {
@@ -177,21 +133,20 @@ func (a *Authenticator) fail(w http.ResponseWriter, r *http.Request, err error) 
 }
 
 func (a *Authenticator) doNegotiate(w http.ResponseWriter, r *http.Request, auth []byte) (user, realm string, err error) {
-	g := &gss{fromgss: make(chan []byte), done: make(chan error), buf: auth}
-	a.accept <- g
+	rbuf := bytes.NewBuffer(auth)
+	wbuf := new(bytes.Buffer)
 
-	reply, rok := <-g.fromgss
-
-	if err := <-g.done; err != nil {
+	_, user, realm, err = a.cred.Accept(readwriter{rbuf, wbuf}, 0)
+	if err != nil {
 		return a.fail(w, r, err)
 	}
 
-	if rok {
+	if wbuf.Len() > 0 {
 		// The auth succeeded and requested that the server authenticate back
-		w.Header().Add(wwwAuthenticate, negotiate+base64.StdEncoding.EncodeToString(reply))
+		w.Header().Add(wwwAuthenticate, negotiate+base64.StdEncoding.EncodeToString(wbuf.Bytes()))
 	}
 
-	return g.username, g.realm, nil
+	return user, realm, nil
 }
 
 func (a *Authenticator) doBasicAuth(w http.ResponseWriter, r *http.Request, auth []byte) (user, realm string, err error) {
@@ -213,24 +168,22 @@ func (a *Authenticator) doBasicAuth(w http.ResponseWriter, r *http.Request, auth
 		return a.fail(w, r, err)
 	}
 
-	// We now run the accept and connect algorithms in two threads and
-	// join them directly up. This has the effect of double checking the
-	// ticket returned by the dc. Make togss and fromgss buffered in case
-	// one of the threads errors out before servicing its input.
-	gc := &gss{fromgss: make(chan []byte, 1), togss: make(chan []byte, 1), done: make(chan error)}
-	ga := &gss{togss: gc.fromgss, fromgss: gc.togss, done: gc.done}
+	// We now run the accept and connect algorithms and join them directly
+	// up. This has the effect of double checking the ticket returned by
+	// the dc.
+	rreq, wreq := io.Pipe()
+	rrep, wrep := io.Pipe()
+	done := make(chan error, 1)
 
-	go gc.connect(tkt)
-	a.accept <- ga
-	errc := <-gc.done
-	erra := <-ga.done
+	go connectThread(tkt, readwriter{rrep, wreq}, done)
 
-	if errc != nil {
-		return a.fail(w, r, errc)
+	_, user, realm, err = cred.Accept(readwriter{rreq, wrep}, 0)
+	if err != nil {
+		return a.fail(w, r, err)
 	}
 
-	if erra != nil {
-		return a.fail(w, r, erra)
+	if err := <-done; err != nil {
+		return a.fail(w, r, err)
 	}
 
 	return user, realm, nil

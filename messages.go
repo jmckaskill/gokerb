@@ -108,23 +108,6 @@ const (
 	KDC_ERR_KDC_NAME_MISMATCH             // Reserved for PKINIT
 )
 
-// App request flags
-const (
-	_ = 1 << iota // reserved
-	useSessionKey
-	MutualAuth
-)
-
-// gss app request flags
-const (
-	gssDelegation = 1 << iota
-	gssMutual
-	gssReplay
-	gssSequence
-	gssConfidentiality
-	gssIntegrity
-)
-
 // Address type
 const (
 	ipv4 = 2
@@ -177,6 +160,22 @@ const (
 	appRequestAuthChecksumKey
 	appRequestAuthKey
 	appReplyEncryptedKey
+	privKey
+	credKey
+	safeChecksumKey
+	_
+	_
+	_
+	_
+	_
+	_
+	_
+	gssAcceptorSeal
+	gssAcceptorSign
+	gssInitiatorSeal
+	gssInitiatorSign
+
+	gssSequenceNumber = -1
 )
 
 const (
@@ -184,15 +183,17 @@ const (
 	applicationClass     = 0x40
 	udpReadTimeout       = 3e9
 	defaultLoginDuration = time.Hour * 24
-	maxUdpWrite          = 1400 // TODO: figure out better way of doing this
+	maxUDPWrite          = 1400 // TODO: figure out better way of doing this
+	maxGSSWrapRead       = 64 * 1024
 )
 
 var (
-	ErrParse         = errors.New("kerb: parse error")
-	ErrProtocol      = errors.New("kerb: protocol error")
-	ErrAuthLoop      = errors.New("kerb: auth loop")
-	ErrInvalidTicket = errors.New("kerb: invalid or expired ticket")
-	ErrPassword      = errors.New("kerb: can't renew the main krbtgt ticket as the password is unknown")
+	ErrParse               = errors.New("kerb: parse error")
+	ErrProtocol            = errors.New("kerb: protocol error")
+	ErrAuthLoop            = errors.New("kerb: auth loop")
+	ErrInvalidTicket       = errors.New("kerb: invalid or expired ticket")
+	ErrPassword            = errors.New("kerb: can't renew the main krbtgt ticket as the password is unknown")
+	ErrNoAvailableSecurity = errors.New("kerb: no available SASL security mode")
 
 	supportedAlgorithms = []int{rc4HmacAlgorithm}
 
@@ -219,19 +220,74 @@ var (
 	gssSpnegoOid  = asn1.ObjectIdentifier([]int{1, 3, 6, 1, 5, 5, 2})
 )
 
+// Flags for tkt.Connect and tkt.Accept
+const (
+	MutualAuth = 1 << iota
+	SASLAuth
+	NoConfidentiality
+	NoIntegrity
+	RequireConfidentiality
+	RequireIntegrity
+)
+
 const (
 	// default of negTokenReply.State so it appears when State is not set
 	// in the asn1 marshalled stream
 	spnegoUseContext = iota - 1
-
 	spnegoAccepted
 	spnegoIncomplete
 	spnegoReject
 	spnegoRequestMIC
+)
 
-	gssAppRequest = 0x0100
-	gssAppReply   = 0x0200
-	gssAppError   = 0x0300
+// gss token types
+const (
+	// From RFC1964
+	gssAppRequest    = 0x0100
+	gssGetMIC        = 0x0101
+	gssDeleteContext = 0x0102
+	gssAppReply      = 0x0200
+	gssWrap          = 0x0201
+	gssAppError      = 0x0300
+)
+
+// App request flags
+const (
+	useSessionKey = 1 << 30
+	mutualAuth    = 1 << 29
+)
+
+// gss app request flags - found in the gss fake checksum in the AP-REQ
+// authenticator
+const (
+	gssDelegation = 1 << iota
+	gssMutual
+	gssReplay
+	gssSequence
+	gssConfidential
+	gssIntegrity
+	gssAnonymous
+	gssProtectionReady
+	gssTransferable
+)
+
+// gss sasl flags - first byte of the 4 bytes gss wrap exchange after the AP-REQ
+const (
+	saslNoSecurity = 1 << iota
+	saslIntegrity
+	saslConfidential
+)
+
+// gss wrap encryption and checksum types
+const (
+	gssSealDES  = 0x0000
+	gssSealRC4  = 0x1000
+	gssSealNone = 0xFFFF
+
+	gssSignDES_MAC_MD5 = 0x0000
+	gssSignMD2_5       = 0x0100
+	gssSignDES_MAC     = 0x0200
+	gssSignHMAC_MD5    = 0x1100
 )
 
 type principalName struct {
@@ -240,14 +296,14 @@ type principalName struct {
 }
 
 type encryptedData struct {
-	Algorithm  int    `asn1:"explicit,tag:0"`
+	Algo       int    `asn1:"explicit,tag:0"`
 	KeyVersion int    `asn1:"optional,explicit,tag:1"`
 	Data       []byte `asn1:"explicit,tag:2"`
 }
 
 type encryptionKey struct {
-	Algorithm int    `asn1:"explicit,tag:0"`
-	Key       []byte `asn1:"explicit,tag:1"`
+	Algo int    `asn1:"explicit,tag:0"`
+	Key  []byte `asn1:"explicit,tag:1"`
 }
 
 type ticket struct {
@@ -279,7 +335,7 @@ type preauth struct {
 }
 
 type checksumData struct {
-	Type int    `asn1:"explicit,tag:0"`
+	Algo int    `asn1:"explicit,tag:0"`
 	Data []byte `asn1:"explicit,tag:1"`
 }
 

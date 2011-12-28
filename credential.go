@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,6 +14,10 @@ import (
 // Host will be converted to the canonical FQDN and appended to service as
 // <service>/<canon fqdn> to create the principal.
 func ResolveService(service, host string) (string, error) {
+	if hpart, _, err := net.SplitHostPort(host); err == nil {
+		host = hpart
+	}
+
 	addrs, err := net.LookupHost(host)
 	if err != nil {
 		return "", err
@@ -33,9 +38,12 @@ func ResolveService(service, host string) (string, error) {
 }
 
 type Credential struct {
-	key             cipher
-	principal       principalName
-	realm           string
+	key       cipher
+	kvno      int
+	principal principalName
+	realm     string
+
+	lk              sync.Mutex
 	cache           map[string]*Ticket
 	tgt             map[string]*Ticket
 	replay          map[replayKey]bool
@@ -50,7 +58,7 @@ type Credential struct {
 // krbtgt/<realm> service ticket.
 func NewCredential(user, realm, password string) *Credential {
 	// Due to use of rc4HmacKey, the key should always be valid
-	key, err := loadKey(rc4HmacAlgorithm, rc4HmacKey(password), 0)
+	key, err := loadKey(rc4HmacAlgorithm, rc4HmacKey(password))
 	if err != nil {
 		panic(err)
 	}
@@ -107,6 +115,7 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 	// AS_REQ login
 	r := request{
 		ckey:    c.key,
+		ckvno:   c.kvno,
 		flags:   defaultLoginFlags,
 		till:    time.Now().Add(defaultLoginDuration),
 		crealm:  c.realm,
@@ -116,13 +125,14 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 	}
 
 	tgt, err := r.do()
+	if r.sock != nil {
+		r.sock.Close()
+	}
 	if err != nil {
 		return nil, "", err
 	}
 
-	// Save the socket for reuse with TGS requests
-	tgt.sock = r.sock
-	tgt.proto = r.proto
+	c.kvno = r.ckvno
 	c.tgt[c.realm] = tgt
 	c.cache["krbtgt/"+c.realm] = tgt
 
@@ -173,6 +183,9 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 		realm = strings.ToUpper(realm)
 	}
 
+	c.lk.Lock()
+	defer c.lk.Unlock()
+
 	if c.cache == nil {
 		c.cache = make(map[string]*Ticket)
 		c.tgt = make(map[string]*Ticket)
@@ -204,18 +217,15 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 			flags:   flags,
 			till:    till,
 			tgt:     tgt,
-			proto:   tgt.proto,
-			sock:    tgt.sock,
 		}
 
 		tkt, err := r.do()
+		if r.sock != nil {
+			r.sock.Close()
+		}
 		if err != nil {
 			return nil, err
 		}
-
-		// r.do() may have closed and opened a new socket
-		tgt.proto = r.proto
-		tgt.sock = r.sock
 
 		tktserv := composePrincipal(tkt.service)
 		c.cache[tktserv] = tkt

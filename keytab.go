@@ -149,13 +149,14 @@ func ReadKeytab(file io.Reader) (creds []*Credential, rerr error) {
 			size -= 4
 		}
 
-		key, err := loadKey(keytype, keydata, kvno)
+		key, err := loadKey(keytype, keydata)
 		if err != nil {
 			return nil, err
 		}
 
 		creds = append(creds, &Credential{
 			key:       key,
+			kvno:      kvno,
 			realm:     parts[0],
 			principal: principalName{nametype, parts[1:]},
 		})
@@ -211,11 +212,11 @@ func (c *Credential) WriteTo(file io.Writer) (int64, error) {
 		d = appendPrincipal(d, t.client, t.crealm)
 		d = appendPrincipal(d, t.service, t.srealm)
 
-		_, key := t.key.Key()
-		d = appendU16(d, uint16(key.Algorithm))
+		key := t.key.Key()
+		d = appendU16(d, uint16(t.key.EncryptAlgo(asReplyClientKey)))
 		d = appendU16(d, 0) // etype - not used
-		d = appendU16(d, uint16(len(key.Key)))
-		d = append(d, key.Key...)
+		d = appendU16(d, uint16(len(key)))
+		d = append(d, key...)
 
 		d = appendU32(d, uint32(t.authTime.Unix()))
 		d = appendU32(d, uint32(t.startTime.Unix()))
@@ -265,7 +266,7 @@ func (c *Credential) readTickets(file io.Reader) (n int64, err error) {
 		keysize := int(readU16(file, &n))
 		keydata := read(file, &n, make([]byte, keysize))
 
-		key, err := loadKey(algorithm, keydata, 0)
+		key, err := loadKey(algorithm, keydata)
 		if err != nil {
 			return n, err
 		}
@@ -420,12 +421,12 @@ func WriteKeytab(file io.Writer, creds []*Credential) error {
 			return ErrPassword
 		}
 
-		kvno, key := c.key.Key()
-		d = append(d, uint8(kvno))
-		d = appendU16(d, uint16(key.Algorithm))
-		d = appendU16(d, uint16(len(key.Key)))
-		d = append(d, key.Key...)
-		d = appendU32(d, uint32(kvno))
+		key := c.key.Key()
+		d = append(d, uint8(c.kvno))
+		d = appendU16(d, uint16(c.key.EncryptAlgo(asReplyClientKey)))
+		d = appendU16(d, uint16(len(key)))
+		d = append(d, key...)
+		d = appendU32(d, uint32(c.kvno))
 
 		binary.BigEndian.PutUint32(d[:4], uint32(len(d)))
 

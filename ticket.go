@@ -19,18 +19,17 @@ func initSequenceNumber() (ret uint32) {
 	return
 }
 
-// To ensure the authenticator is unique we use the microseconds field as a
-// sequence number as its required anyways
 var usSequenceNumber uint32 = initSequenceNumber()
 
-func nextSequenceNumber() int {
-	return int(atomic.AddUint32(&usSequenceNumber, 1))
+func nextSequenceNumber() uint32 {
+	return atomic.AddUint32(&usSequenceNumber, 1)
 }
 
 type request struct {
 	client  principalName
 	crealm  string
 	ckey    cipher // only needed for AS requests when tgt == nil
+	ckvno   int
 	service principalName
 	srealm  string
 	till    time.Time
@@ -40,7 +39,7 @@ type request struct {
 	// Setup by request.do()
 	nonce  uint32
 	time   time.Time
-	seqnum int
+	seqnum uint32
 	sock   net.Conn
 	proto  string
 }
@@ -80,13 +79,21 @@ func (r *request) sendRequest() error {
 		reqParam = tgsRequestParam
 		req.MsgType = tgsRequestType
 
+		calgo := r.tgt.key.SignAlgo(paTgsRequestChecksumKey)
+		chk, err := r.tgt.key.Sign([][]byte{bodyData}, calgo, paTgsRequestChecksumKey)
+
+		if err != nil {
+			return err
+		}
+
 		auth := authenticator{
-			ProtoVersion: kerberosVersion,
-			ClientRealm:  r.crealm,
-			Client:       r.client,
-			Microseconds: r.seqnum % 1000000,
-			Time:         r.time,
-			Checksum:     r.tgt.key.Checksum(bodyData, paTgsRequestChecksumKey),
+			ProtoVersion:   kerberosVersion,
+			ClientRealm:    r.crealm,
+			Client:         r.client,
+			Microseconds:   r.time.Nanosecond() / 1000,
+			SequenceNumber: r.seqnum,
+			Time:           r.time,
+			Checksum:       checksumData{calgo, chk},
 		}
 
 		authData, err := asn1.MarshalWithParams(auth, authenticatorParam)
@@ -99,7 +106,10 @@ func (r *request) sendRequest() error {
 			MsgType:       appRequestType,
 			Flags:         flagsToBitString(0),
 			Ticket:        asn1.RawValue{FullBytes: r.tgt.ticket},
-			Authenticator: r.tgt.key.Encrypt(authData, paTgsRequestKey),
+			Authenticator: encryptedData{
+				Algo: r.tgt.key.EncryptAlgo(paTgsRequestKey),
+				Data: r.tgt.key.Encrypt(authData, nil, paTgsRequestKey),
+			},
 		}
 
 		appData, err := asn1.MarshalWithParams(app, appRequestParam)
@@ -115,12 +125,16 @@ func (r *request) sendRequest() error {
 		reqParam = asRequestParam
 		req.MsgType = asRequestType
 
-		ts, err := asn1.Marshal(encryptedTimestamp{r.time, r.seqnum % 1000000})
+		// Use the sequence number as the microseconds in the
+		// timestamp so that each one is guarenteed to be unique
+		ts, err := asn1.Marshal(encryptedTimestamp{r.time, int(r.seqnum % 1000000)})
 		if err != nil {
 			return err
 		}
 
-		enc, err := asn1.Marshal(r.ckey.Encrypt(ts, paEncryptedTimestampKey))
+		algo := r.ckey.EncryptAlgo(paEncryptedTimestampKey)
+		edata := r.ckey.Encrypt(ts, nil, paEncryptedTimestampKey)
+		enc, err := asn1.Marshal(encryptedData{algo, r.ckvno, edata})
 		if err != nil {
 			return err
 		}
@@ -139,7 +153,7 @@ func (r *request) sendRequest() error {
 		}
 	}
 
-	if r.proto == "udp" && len(data) > maxUdpWrite {
+	if r.proto == "udp" && len(data) > maxUDPWrite {
 		return io.ErrShortWrite
 	}
 
@@ -237,19 +251,13 @@ func (r *request) recvReply() (*Ticket, error) {
 
 	// TGS doesn't use key versions as its using session keys
 	if r.tgt == nil {
-		if rep.Encrypted.KeyVersion == 0 {
-			return nil, ErrProtocol
-		}
-
-		kvno, _ := key.Key()
-
 		// If we created the key from a keytab then we know the
 		// version number, if we created it from plaintext then we use
 		// the reply to find the key version
 
-		if kvno == 0 {
-			key.SetKeyVersion(rep.Encrypted.KeyVersion)
-		} else if kvno != rep.Encrypted.KeyVersion {
+		if r.ckvno == 0 {
+			r.ckvno = rep.Encrypted.KeyVersion
+		} else if r.ckvno != rep.Encrypted.KeyVersion {
 			return nil, ErrProtocol
 		}
 	}
@@ -257,7 +265,7 @@ func (r *request) recvReply() (*Ticket, error) {
 	// Decode encrypted part
 
 	enc := encryptedKdcReply{}
-	if edata, err := key.Decrypt(rep.Encrypted, usage); err != nil {
+	if edata, err := key.Decrypt(rep.Encrypted.Data, nil, rep.Encrypted.Algo, usage); err != nil {
 		return nil, err
 	} else if _, err := asn1.UnmarshalWithParams(edata, &enc, encparam); err != nil {
 		return nil, err
@@ -269,7 +277,7 @@ func (r *request) recvReply() (*Ticket, error) {
 		return nil, ErrProtocol
 	}
 
-	key, err := loadKey(enc.Key.Algorithm, enc.Key.Key, 0)
+	key, err := loadKey(enc.Key.Algo, enc.Key.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -301,8 +309,6 @@ type Ticket struct {
 	startTime time.Time
 	flags     int
 	key       cipher
-	sock      net.Conn
-	proto     string
 }
 
 func open(proto, realm string) (net.Conn, error) {
