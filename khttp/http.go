@@ -1,7 +1,6 @@
-package khttp
-
 // Package khttp provides HTTP client/server functions that allow you to
 // authenticate HTTP using kerberos.
+package khttp
 
 import (
 	"bytes"

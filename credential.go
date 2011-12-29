@@ -1,34 +1,40 @@
-package kerb
+/*
+Package kerb implements a kerberos V5 ticket and credential manager.
 
-// Package kerb implements a kerberos V5 ticket and credential manager.
-//
-// Kerberos is a network authentication system that allows users to
-// authenticate to servers and vice versa without the user or server revealing
-// their password. It does this by acquiring a ticket from a trusted third
-// party and then presenting this ticket to the server.
-//
-// Glossary:
-// Principal - A user ID that can be authenticated in a given realm. User
-// principals are normally a single word. Service principals are of the form
-// service/<FQDN>.
-//
-// Realm - Set of users IDs that are controlled by one key database. Realms
-// can have trust chains between them such that a user ID in one realm can
-// authenticate to a user ID from another. Similar to the domain in an email
-// address.
-//
-// Keytab - File used to store a service principal along with its private key.
-// With this a server can authenticate an incoming request without checking
-// with the key server.
-//
-// Credential Cache - File used by MIT and heimdal kerberos to store the local
-// users cached tickets. On unix systems `klist` will list the tickets in a
-// cache.
-//
-// Ticket - Chunk of data acquired from the key server that allows a given
-// principal to authenticate to a given service for a specified period of
-// time. Can also include a number of further restrictions/extensions (EG
-// ability to forward the ticket).
+Kerberos is a network authentication system that allows users to authenticate
+to servers and vice versa without the user or server revealing their password.
+It does this by acquiring a ticket from a trusted third party and then
+presenting this ticket to the server.
+
+Glossary:
+
+Principal:
+	A user ID that can be authenticated in a given realm. User principals
+	are normally a single word. Service principals are of the form
+	service/<FQDN>.
+
+Realm:
+	Set of users IDs that are controlled by one key database. Realms can
+	have trust chains between them such that a user ID in one realm can
+	authenticate to a user ID from another. Similar to the domain in an
+	email address.
+
+Keytab:
+	File used to store a service principal along with its private key.
+	With this a server can authenticate an incoming request without
+	checking with the key server.
+
+Credential Cache:
+	File used by MIT and heimdal kerberos to store the local users cached
+	tickets. On unix systems `klist` will list the tickets in a cache.
+
+Ticket:
+	Chunk of data acquired from the key server that allows a given
+	principal to authenticate to a given service for a specified period of
+	time. Can also include a number of further restrictions/extensions (EG
+	ability to forward the ticket).
+*/
+package kerb
 
 import (
 	"fmt"
