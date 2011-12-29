@@ -9,25 +9,6 @@ import (
 	"time"
 )
 
-// KDC request flags
-const (
-	Forwardable                 = 1 << 30
-	Forwarded                   = 1 << 29
-	Proxiable                   = 1 << 28
-	Proxy                       = 1 << 27
-	AllowPostdate               = 1 << 26
-	Postdated                   = 1 << 25
-	Renewable                   = 1 << 23
-	Canonicalize                = 1 << 16
-	DisableTransitedCheck       = 1 << 5
-	RenewableOk                 = 1 << 4
-	EncryptedTicketInSessionKey = 1 << 3
-	Renew                       = 1 << 1
-	Validate                    = 1 << 0
-
-	defaultLoginFlags = 0
-)
-
 // Remote error codes
 const (
 	KDC_ERR_NONE                 = iota // No error

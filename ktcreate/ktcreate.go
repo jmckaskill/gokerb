@@ -49,7 +49,7 @@ func main() {
 	cred := kerb.NewCredential(user, realm, pass)
 
 	// Get the login ticket to get the version number and check the password
-	if _, err := cred.GetTicket("krbtgt/"+realm, realm, time.Now().Add(time.Hour), 0); err != nil {
+	if _, err := cred.GetTicket("krbtgt/"+realm, time.Now().Add(time.Hour), 0); err != nil {
 		fmt.Println(err)
 		os.Exit(-1)
 	}

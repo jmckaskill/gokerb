@@ -42,12 +42,12 @@ type request struct {
 	proto  string
 }
 
-// send sends a single ticket request down the sock writer. If r.tgt is set
-// this is a ticket granting service request, otherwise its an authentication
-// service request. Note this does not use any random data, so resending will
-// generate the exact same byte stream. This is needed with UDP connections
-// such that if the remote receives multiple retries it discards the latters
-// as replays.
+// sendRequest sends a single ticket request down the sock writer. If r.tgt is
+// set this is a ticket granting service request, otherwise its an
+// authentication service request. Note this does not use any random data, so
+// resending will generate the exact same byte stream. This is needed with UDP
+// connections such that if the remote receives multiple retries it discards
+// the latters as replays.
 func (r *request) sendRequest() (err error) {
 	defer recoverMust(&err)
 
@@ -302,6 +302,8 @@ type timeoutError interface {
 	Timeout() bool
 }
 
+// do performs an AS_REQ (r.ckey != nil) or TGS_REQ (r.tgt != nil) returning a
+// new ticket
 func (r *request) do() (tkt *Ticket, err error) {
 	r.nonce = 0
 
@@ -379,14 +381,17 @@ func (r *request) do() (tkt *Ticket, err error) {
 	return nil, err
 }
 
+// Principal returns the principal of the service the ticket is for
 func (t *Ticket) Principal() string {
 	return composePrincipal(t.service)
 }
 
+// Realm returns the realm of the service the ticket is for
 func (t *Ticket) Realm() string {
 	return t.srealm
 }
 
+// ExpiryTime returns the time at which the ticket expires
 func (t *Ticket) ExpiryTime() time.Time {
 	return t.till
 }

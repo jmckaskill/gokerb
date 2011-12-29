@@ -1,5 +1,35 @@
 package kerb
 
+// Package kerb implements a kerberos V5 ticket and credential manager.
+//
+// Kerberos is a network authentication system that allows users to
+// authenticate to servers and vice versa without the user or server revealing
+// their password. It does this by acquiring a ticket from a trusted third
+// party and then presenting this ticket to the server.
+//
+// Glossary:
+// Principal - A user ID that can be authenticated in a given realm. User
+// principals are normally a single word. Service principals are of the form
+// service/<FQDN>.
+//
+// Realm - Set of users IDs that are controlled by one key database. Realms
+// can have trust chains between them such that a user ID in one realm can
+// authenticate to a user ID from another. Similar to the domain in an email
+// address.
+//
+// Keytab - File used to store a service principal along with its private key.
+// With this a server can authenticate an incoming request without checking
+// with the key server.
+//
+// Credential Cache - File used by MIT and heimdal kerberos to store the local
+// users cached tickets. On unix systems `klist` will list the tickets in a
+// cache.
+//
+// Ticket - Chunk of data acquired from the key server that allows a given
+// principal to authenticate to a given service for a specified period of
+// time. Can also include a number of further restrictions/extensions (EG
+// ability to forward the ticket).
+
 import (
 	"fmt"
 	"net"
@@ -37,6 +67,16 @@ func ResolveService(service, host string) (string, error) {
 	return fmt.Sprintf("%s/%s", service, name), nil
 }
 
+// Credential is a wrapper for a locally owned user or service principal. It
+// can be used to authenticate to other services or to check incoming requests
+// against. A credential can be created from a user, realm, password triple, a
+// credential cache created by MIT or heimdal kerberos, or a keytab created
+// for a service principal.
+//
+// It will store the password in hashed form if created from a keytab or
+// plaintext password so that we can renew tickets.  This is not possible if
+// created from a credential cache as the cache doesn't store the user
+// password in any form.
 type Credential struct {
 	key       cipher
 	kvno      int
@@ -56,6 +96,8 @@ type Credential struct {
 //
 // This does not check if the password is valid. To do that request the
 // krbtgt/<realm> service ticket.
+//
+// TODO: Check that UTF8 usernames actually work.
 func NewCredential(user, realm, password string) *Credential {
 	return &Credential{
 		key:       mustLoadKey(rc4HmacAlgorithm, rc4HmacKey(password)),
@@ -133,6 +175,25 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 	return tgt, c.realm, nil
 }
 
+// Flag values for GetTicket
+const (
+	TicketForwardable                 = 1 << 30
+	TicketForwarded                   = 1 << 29
+	TicketProxiable                   = 1 << 28
+	TicketProxy                       = 1 << 27
+	TicketAllowPostdate               = 1 << 26
+	TicketPostdated                   = 1 << 25
+	TicketRenewable                   = 1 << 23
+	TicketCanonicalize                = 1 << 16
+	TicketDisableTransitedCheck       = 1 << 5
+	TicketRenewableOk                 = 1 << 4
+	TicketEncryptedTicketInSessionKey = 1 << 3
+	TicketRenew                       = 1 << 1
+	TicketValidate                    = 1 << 0
+
+	defaultLoginFlags = 0
+)
+
 // GetTicket returns a valid ticket for the given service and realm.
 //
 // The ticket will be pulled from the cache if possible, but if not GetTicket
@@ -145,7 +206,7 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 //
 // Cached entries will not be used if they don't meet all the flags, but the
 // returned ticket may not have all the flags if the domain policy forbids
-// some of them.
+// some of them. Valid flag values are of the form Ticket*.
 func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Ticket, error) {
 	// One of a number of possiblities:
 	// 1. Init state (no keys) user is requesting service key. Send AS_REQ then send TGS_REQ.
@@ -225,7 +286,7 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 
 		// We can validly get a different service back if we set the
 		// canon flag
-		if (flags & Canonicalize) != 0 {
+		if (flags & TicketCanonicalize) != 0 {
 			c.cache[service] = tkt
 			return tkt, nil
 		}
@@ -236,10 +297,12 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 	return nil, ErrAuthLoop
 }
 
+// Principal returns the credential's associated principal
 func (c *Credential) Principal() string {
 	return composePrincipal(c.principal)
 }
 
+// Realm returns the credential's associated realm
 func (c *Credential) Realm() string {
 	return c.realm
 }

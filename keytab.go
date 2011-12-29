@@ -85,6 +85,10 @@ func readPrincipal2(file io.Reader, p *int64, ntype int) (n principalName, realm
 // ReadKeytab reads a MIT kerberos keytab file returning all credentials found
 // within.
 //
+// Keytabs are typically used for service principals and keys for servers that
+// need to authenticate incoming requests or for automated user principals
+// that need to be able to renew their login.
+//
 // These are produced by MIT, heimdal, and the ktpass utility on windows.
 func ReadKeytab(file io.Reader) (creds []*Credential, err error) {
 	defer recoverMust(&err)
@@ -173,6 +177,8 @@ func appendPrincipal(d []byte, princ principalName, realm string) []byte {
 	return d
 }
 
+// WriteTo writes the credential and cached tickets out to a file as a
+// credential cache. This can then be read in by MIT or heimdal kerberos.
 func (c *Credential) WriteTo(file io.Writer) (int64, error) {
 	now := time.Now()
 	n := int64(0)
@@ -337,6 +343,9 @@ func (c *Credential) ReadFrom(file io.Reader) (n int64, err error) {
 	return n, err
 }
 
+// ReadCredentialCache reads a credential cache in from file returning a new
+// credential. Since credential caches do not have the private key, tickets
+// can not be acquired/renewed once the ticket granting ticket expires.
 func ReadCredentialCache(file io.Reader) (rc *Credential, err error) {
 	defer recoverMust(&err)
 	n := int64(0)
@@ -357,6 +366,8 @@ func ReadCredentialCache(file io.Reader) (rc *Credential, err error) {
 	return c, nil
 }
 
+// WriteKeytab writes the list of credentials out to a keytab. Keytabs store a
+// list of principals and their associated keys but not any cached tickets.
 func WriteKeytab(file io.Writer, creds []*Credential) error {
 	d := []byte{}
 

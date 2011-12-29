@@ -95,6 +95,11 @@ type replayKey struct {
 	sequenceNumber uint32
 }
 
+// Connect authenticates to a remote service by sending the given ticket.
+//
+// If SASLAuth is used and a GSS wrapped connection is established, gssrw
+// returns a wrapped version of rw that performs the integrity/confidentiality
+// wrapping. If no wrapper is negotiated then gssrw is nil.
 func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err error) {
 	defer recoverMust(&err)
 
@@ -469,6 +474,15 @@ func (c *Credential) isReplay(auth *authenticator, etkt *encryptedTicket) bool {
 	return false
 }
 
+// Accept reads in a connect request checking that it is valid for the given
+// credential.
+//
+// If SASLAuth is requested and a GSS wrapped connection is negotiated for
+// integrity/confidentiality then gssrw returns a wrapped version of rw which
+// performs the wrapping.
+//
+// Accept also returns the user and realm that the client authenticated with
+// if successful.
 func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, user, realm string, err error) {
 	// TODO send error replies
 	defer recoverMust(&err)
