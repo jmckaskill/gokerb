@@ -57,14 +57,8 @@ type Credential struct {
 // This does not check if the password is valid. To do that request the
 // krbtgt/<realm> service ticket.
 func NewCredential(user, realm, password string) *Credential {
-	// Due to use of rc4HmacKey, the key should always be valid
-	key, err := loadKey(rc4HmacAlgorithm, rc4HmacKey(password))
-	if err != nil {
-		panic(err)
-	}
-
 	return &Credential{
-		key:       key,
+		key:       mustLoadKey(rc4HmacAlgorithm, rc4HmacKey(password)),
 		principal: principalName{principalNameType, []string{user}},
 		realm:     strings.ToUpper(realm),
 	}
@@ -139,10 +133,6 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 	return tgt, c.realm, nil
 }
 
-func (c *Credential) GetLoginTicket(till time.Time, flags int) (*Ticket, error) {
-	return c.GetTicket("krbtgt/"+c.realm, c.realm, till, flags)
-}
-
 // GetTicket returns a valid ticket for the given service and realm.
 //
 // The ticket will be pulled from the cache if possible, but if not GetTicket
@@ -156,10 +146,7 @@ func (c *Credential) GetLoginTicket(till time.Time, flags int) (*Ticket, error) 
 // Cached entries will not be used if they don't meet all the flags, but the
 // returned ticket may not have all the flags if the domain policy forbids
 // some of them.
-//
-// The realm if specified is used as a hint for which KDC to use if no cached
-// ticket is found.
-func (c *Credential) GetTicket(service, realm string, till time.Time, flags int) (*Ticket, error) {
+func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Ticket, error) {
 	// One of a number of possiblities:
 	// 1. Init state (no keys) user is requesting service key. Send AS_REQ then send TGS_REQ.
 	// 2. Init state (no keys) user is requesting krbtgt key. Send AS_REQ, find krbtgt key in cache.
@@ -175,14 +162,6 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 	// We require that cached entries have at least 10 minutes left to use
 	ctill := time.Now().Add(time.Minute * 10)
 
-	if realm == "" {
-		realm = c.realm
-	} else {
-		// Realms are case-insensitive, but kerberos is
-		// case-sensitive. The RFC recommends always using upper case.
-		realm = strings.ToUpper(realm)
-	}
-
 	c.lk.Lock()
 	defer c.lk.Unlock()
 
@@ -195,7 +174,7 @@ func (c *Credential) GetTicket(service, realm string, till time.Time, flags int)
 		return tkt, nil
 	}
 
-	tgt, tgtrealm, err := c.getTgt(realm, till)
+	tgt, tgtrealm, err := c.getTgt(c.realm, till)
 	if err != nil {
 		return nil, err
 	}

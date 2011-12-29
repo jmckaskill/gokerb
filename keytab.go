@@ -18,7 +18,7 @@ func read(file io.Reader, p *int64, buf []byte) []byte {
 	n, err := io.ReadFull(file, buf)
 	*p += int64(n)
 	if err != nil {
-		panic(err)
+		errpanic(err)
 	}
 	return buf
 }
@@ -27,7 +27,7 @@ func skip(file io.Reader, p *int64, n int) {
 	m, err := io.CopyN(ioutil.Discard, file, int64(n))
 	*p += m
 	if err != nil {
-		panic(err)
+		errpanic(err)
 	}
 }
 
@@ -57,7 +57,7 @@ func tryRead32(file io.Reader, p *int64, v *int) bool {
 	if n == 0 && err == io.EOF {
 		return false
 	} else if err != nil {
-		panic(err)
+		errpanic(err)
 	}
 
 	*v = int(binary.BigEndian.Uint32(buf[:]))
@@ -86,19 +86,11 @@ func readPrincipal2(file io.Reader, p *int64, ntype int) (n principalName, realm
 // within.
 //
 // These are produced by MIT, heimdal, and the ktpass utility on windows.
-func ReadKeytab(file io.Reader) (creds []*Credential, rerr error) {
+func ReadKeytab(file io.Reader) (creds []*Credential, err error) {
+	defer recoverMust(&err)
+
 	n := int64(0)
-
-	defer func() {
-		if err, ok := recover().(error); err != nil && ok {
-			rerr = err
-			creds = nil
-		}
-	}()
-
-	if readU16(file, &n) != keytabVersion {
-		return nil, ErrParse
-	}
+	must(readU16(file, &n) == keytabVersion)
 
 	size := 0
 	for tryRead32(file, &n, &size) {
@@ -140,20 +132,14 @@ func ReadKeytab(file io.Reader) (creds []*Credential, rerr error) {
 		keydata := read(file, &n, make([]byte, keysize))
 		size -= keysize
 
-		if size < 0 {
-			return nil, ErrParse
-		}
+		must(size >= 0)
 
 		if size >= 4 {
 			kvno = int(readU32(file, &n))
 			size -= 4
 		}
 
-		key, err := loadKey(keytype, keydata)
-		if err != nil {
-			return nil, err
-		}
-
+		key := mustLoadKey(keytype, keydata)
 		creds = append(creds, &Credential{
 			key:       key,
 			kvno:      kvno,
@@ -252,7 +238,7 @@ func (s ErrWrongPrincipal) Error() string {
 	return fmt.Sprintf("kerb: cache has wrong principal, expected %s@%s, got %s@%s", s.expectedUser, s.expectedRealm, s.User, s.Realm)
 }
 
-func (c *Credential) readTickets(file io.Reader) (n int64, err error) {
+func mustReadTickets(c *Credential, file io.Reader) (n int64) {
 	now := time.Now()
 	ctype := 0
 
@@ -266,10 +252,7 @@ func (c *Credential) readTickets(file io.Reader) (n int64, err error) {
 		keysize := int(readU16(file, &n))
 		keydata := read(file, &n, make([]byte, keysize))
 
-		key, err := loadKey(algorithm, keydata)
-		if err != nil {
-			return n, err
-		}
+		key := mustLoadKey(algorithm, keydata)
 
 		auth := time.Unix(int64(readU32(file, &n)), 0)
 		start := time.Unix(int64(readU32(file, &n)), 0)
@@ -328,7 +311,7 @@ func (c *Credential) readTickets(file io.Reader) (n int64, err error) {
 		c.cache[name] = tkt
 	}
 
-	return n, nil
+	return n
 }
 
 // ReadFrom reads a MIT kerberos credential cache file.
@@ -339,42 +322,26 @@ func (c *Credential) readTickets(file io.Reader) (n int64, err error) {
 //
 // All the tickets will be put into the credential's ticket cache (and can
 // be subsequently retrieved using GetTicket).
-func (c *Credential) ReadFrom(file io.Reader) (n int64, rerr error) {
-	defer func() {
-		if err, ok := recover().(error); ok && err != nil {
-			rerr = err
-		}
-	}()
+func (c *Credential) ReadFrom(file io.Reader) (n int64, err error) {
+	defer recoverMust(&err)
 
-	if readU16(file, &n) != cacheVersion {
-		return n, ErrParse
-	}
+	must(readU16(file, &n) == cacheVersion)
 
 	hlen := int(readU16(file, &n))
 	skip(file, &n, hlen)
 
 	princ, realm := readPrincipal(file, &n)
-	if !nameEquals(princ, c.principal) || realm != c.realm {
-		return n, ErrParse
-	}
+	must(realm == c.realm && nameEquals(princ, c.principal))
 
-	m, err := c.readTickets(file)
-	n += m
+	n += mustReadTickets(c, file)
 	return n, err
 }
 
-func ReadCredentialCache(file io.Reader) (rc *Credential, rerr error) {
+func ReadCredentialCache(file io.Reader) (rc *Credential, err error) {
+	defer recoverMust(&err)
 	n := int64(0)
 
-	defer func() {
-		if err, ok := recover().(error); ok && err != nil {
-			rerr = err
-		}
-	}()
-
-	if readU16(file, &n) != cacheVersion {
-		return nil, ErrParse
-	}
+	must(readU16(file, &n) == cacheVersion)
 
 	hlen := int(readU16(file, &n))
 	skip(file, &n, hlen)
@@ -386,10 +353,7 @@ func ReadCredentialCache(file io.Reader) (rc *Credential, rerr error) {
 		realm:     realm,
 	}
 
-	if _, err := c.readTickets(file); err != nil {
-		return nil, err
-	}
-
+	n += mustReadTickets(c, file)
 	return c, nil
 }
 

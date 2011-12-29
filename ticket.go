@@ -13,10 +13,8 @@ import (
 )
 
 func initSequenceNumber() (ret uint32) {
-	if err := binary.Read(rand.Reader, binary.BigEndian, &ret); err != nil {
-		panic(err)
-	}
-	return
+	buf := mustRead(rand.Reader, make([]byte, 4))
+	return binary.BigEndian.Uint32(buf)
 }
 
 var usSequenceNumber uint32 = initSequenceNumber()
@@ -50,7 +48,9 @@ type request struct {
 // generate the exact same byte stream. This is needed with UDP connections
 // such that if the remote receives multiple retries it discards the latters
 // as replays.
-func (r *request) sendRequest() error {
+func (r *request) sendRequest() (err error) {
+	defer recoverMust(&err)
+
 	body := kdcRequestBody{
 		Client:       r.client,
 		ServiceRealm: r.srealm,
@@ -61,30 +61,23 @@ func (r *request) sendRequest() error {
 		Algorithms:   supportedAlgorithms,
 	}
 
-	bodyData, err := asn1.Marshal(body)
-	if err != nil {
-		return err
-	}
+	bodydata := mustMarshal(body, "")
 
-	reqParam := ""
+	reqparam := ""
 	req := kdcRequest{
 		ProtoVersion: kerberosVersion,
-		Body:         asn1.RawValue{FullBytes: bodyData},
+		Body:         asn1.RawValue{FullBytes: bodydata},
 		// MsgType and Preauth filled out below
 	}
 
 	if r.tgt != nil {
 		// For TGS requests we stash an AP_REQ for the ticket granting
 		// service (using the krbtgt) as a preauth.
-		reqParam = tgsRequestParam
+		reqparam = tgsRequestParam
 		req.MsgType = tgsRequestType
 
 		calgo := r.tgt.key.SignAlgo(paTgsRequestChecksumKey)
-		chk, err := r.tgt.key.Sign([][]byte{bodyData}, calgo, paTgsRequestChecksumKey)
-
-		if err != nil {
-			return err
-		}
+		chk := mustSign(r.tgt.key, [][]byte{bodydata}, calgo, paTgsRequestChecksumKey)
 
 		auth := authenticator{
 			ProtoVersion:   kerberosVersion,
@@ -96,11 +89,7 @@ func (r *request) sendRequest() error {
 			Checksum:       checksumData{calgo, chk},
 		}
 
-		authData, err := asn1.MarshalWithParams(auth, authenticatorParam)
-		if err != nil {
-			return err
-		}
-
+		authdata := mustMarshal(auth, authenticatorParam)
 		app := appRequest{
 			ProtoVersion:  kerberosVersion,
 			MsgType:       appRequestType,
@@ -108,116 +97,93 @@ func (r *request) sendRequest() error {
 			Ticket:        asn1.RawValue{FullBytes: r.tgt.ticket},
 			Authenticator: encryptedData{
 				Algo: r.tgt.key.EncryptAlgo(paTgsRequestKey),
-				Data: r.tgt.key.Encrypt(authData, nil, paTgsRequestKey),
+				Data: r.tgt.key.Encrypt(authdata, nil, paTgsRequestKey),
 			},
 		}
 
-		appData, err := asn1.MarshalWithParams(app, appRequestParam)
-		if err != nil {
-			return err
-		}
+		appdata := mustMarshal(app, appRequestParam)
+		req.Preauth = []preauth{{paTgsRequest, appdata}}
 
-		req.Preauth = []preauth{{paTgsRequest, appData}}
 	} else {
 		// For AS requests we add a PA-ENC-TIMESTAMP preauth, even if
 		// its always required rather than trying to handle the
 		// preauth error return.
-		reqParam = asRequestParam
+		reqparam = asRequestParam
 		req.MsgType = asRequestType
 
 		// Use the sequence number as the microseconds in the
 		// timestamp so that each one is guarenteed to be unique
-		ts, err := asn1.Marshal(encryptedTimestamp{r.time, int(r.seqnum % 1000000)})
-		if err != nil {
-			return err
-		}
+		tsdata := mustMarshal(encryptedTimestamp{r.time, int(r.seqnum % 1000000)}, "")
 
 		algo := r.ckey.EncryptAlgo(paEncryptedTimestampKey)
-		edata := r.ckey.Encrypt(ts, nil, paEncryptedTimestampKey)
-		enc, err := asn1.Marshal(encryptedData{algo, r.ckvno, edata})
-		if err != nil {
-			return err
-		}
+		edata := r.ckey.Encrypt(tsdata, nil, paEncryptedTimestampKey)
+		enc := mustMarshal(encryptedData{algo, r.ckvno, edata}, "")
 
 		req.Preauth = []preauth{{paEncryptedTimestamp, enc}}
 	}
 
-	data, err := asn1.MarshalWithParams(req, reqParam)
-	if err != nil {
-		return err
-	}
+	data := mustMarshal(req, reqparam)
 
 	if r.proto == "tcp" {
-		if err := binary.Write(r.sock, binary.BigEndian, uint32(len(data))); err != nil {
-			return err
-		}
+		var bsz [4]byte
+		binary.BigEndian.PutUint32(bsz[:], uint32(len(data)))
+		mustWrite(r.sock, bsz[:])
 	}
 
 	if r.proto == "udp" && len(data) > maxUDPWrite {
-		return io.ErrShortWrite
+		errpanic(io.ErrShortWrite)
 	}
 
-	if _, err := r.sock.Write(data); err != nil {
-		return err
-	}
-
+	mustWrite(r.sock, data)
 	return nil
 }
 
-type RemoteError struct {
+var _ error = ErrRemote{}
+
+type ErrRemote struct {
 	msg *errorMessage
 }
 
-func (e RemoteError) ErrorCode() int {
+func (e ErrRemote) ErrorCode() int {
 	return e.msg.ErrorCode
 }
 
-func (e RemoteError) Error() string {
-	return fmt.Sprintf("kerb: remote error %d", e.msg.ErrorCode)
+func (e ErrRemote) Error() string {
+	return fmt.Sprintf("kerb: remote error %d %s", e.msg.ErrorCode, e.msg.ErrorText)
 }
 
-func (r *request) recvReply() (*Ticket, error) {
+func (r *request) recvReply() (tkt *Ticket, err error) {
+	defer recoverMust(&err)
+
 	var data []byte
 
 	switch r.proto {
 	case "tcp":
 		// TCP streams prepend a 32bit big endian size before each PDU
-		var size uint32
-		if err := binary.Read(r.sock, binary.BigEndian, &size); err != nil {
-			return nil, err
-		}
+		bsz := [4]byte{}
+		mustReadFull(r.sock, bsz[:])
+
+		size := int(binary.BigEndian.Uint32(bsz[:]))
+		must(0 <= size && size <= maxPDUSize)
 
 		data = make([]byte, size)
-
-		if _, err := io.ReadFull(r.sock, data); err != nil {
-			return nil, err
-		}
+		mustReadFull(r.sock, data)
 
 	case "udp":
 		// UDP PDUs are packed in individual frames
-		data = make([]byte, 4096)
-
-		n, err := r.sock.Read(data)
-		if err != nil {
-			return nil, err
-		}
-
-		data = data[:n]
+		data = make([]byte, maxPDUSize)
+		data = mustRead(r.sock, data)
 
 	default:
-		panic("")
+		errpanic(ErrInvalidProto(r.proto))
 	}
 
-	if len(data) == 0 {
-		return nil, ErrParse
-	}
+	must(len(data) > 0)
 
 	if (data[0] & 0x1F) == errorType {
 		errmsg := errorMessage{}
-		if _, err := asn1.UnmarshalWithParams(data, &errmsg, errorParam); err != nil {
-			return nil, err
-		}
-		return nil, RemoteError{&errmsg}
+		mustUnmarshal(data, &errmsg, errorParam)
+		return nil, ErrRemote{&errmsg}
 	}
 
 	var msgtype, usage int
@@ -239,15 +205,10 @@ func (r *request) recvReply() (*Ticket, error) {
 	}
 
 	// Decode reply body
-
 	rep := kdcReply{}
-	if _, err := asn1.UnmarshalWithParams(data, &rep, repparam); err != nil {
-		return nil, err
-	}
-
-	if rep.MsgType != msgtype || rep.ProtoVersion != kerberosVersion || !nameEquals(rep.Client, r.client) || rep.ClientRealm != r.crealm {
-		return nil, ErrProtocol
-	}
+	mustUnmarshal(data, &rep, repparam)
+	must(rep.ProtoVersion == kerberosVersion && rep.MsgType == msgtype)
+	must(rep.ClientRealm == r.crealm && nameEquals(rep.Client, r.client))
 
 	// TGS doesn't use key versions as its using session keys
 	if r.tgt == nil {
@@ -257,30 +218,20 @@ func (r *request) recvReply() (*Ticket, error) {
 
 		if r.ckvno == 0 {
 			r.ckvno = rep.Encrypted.KeyVersion
-		} else if r.ckvno != rep.Encrypted.KeyVersion {
-			return nil, ErrProtocol
+		} else {
+			must(r.ckvno == rep.Encrypted.KeyVersion)
 		}
 	}
 
 	// Decode encrypted part
-
 	enc := encryptedKdcReply{}
-	if edata, err := key.Decrypt(rep.Encrypted.Data, nil, rep.Encrypted.Algo, usage); err != nil {
-		return nil, err
-	} else if _, err := asn1.UnmarshalWithParams(edata, &enc, encparam); err != nil {
-		return nil, err
-	}
+	edata := mustDecrypt(key, rep.Encrypted.Data, nil, rep.Encrypted.Algo, usage)
+	mustUnmarshal(edata, &enc, encparam)
 
 	// The returned service may be different from the request. This
 	// happens when we get a tgt of the next server to try.
-	if enc.Nonce != r.nonce || enc.ServiceRealm != r.srealm {
-		return nil, ErrProtocol
-	}
-
-	key, err := loadKey(enc.Key.Algo, enc.Key.Key)
-	if err != nil {
-		return nil, err
-	}
+	must(enc.Nonce == r.nonce && enc.ServiceRealm == r.srealm)
+	key = mustLoadKey(enc.Key.Algo, enc.Key.Key)
 
 	return &Ticket{
 		client:    r.client,
@@ -313,7 +264,7 @@ type Ticket struct {
 
 func open(proto, realm string) (net.Conn, error) {
 	if proto != "tcp" && proto != "udp" {
-		panic("invalid protocol: " + proto)
+		errpanic(ErrInvalidProto(proto))
 	}
 
 	_, addrs, err := net.LookupSRV("kerberos", proto, realm)
@@ -396,7 +347,7 @@ func (r *request) do() (tkt *Ticket, err error) {
 		if err == nil {
 			return tkt, nil
 
-		} else if e, ok := err.(RemoteError); r.proto == "udp" && ok && e.ErrorCode() == KRB_ERR_RESPONSE_TOO_BIG {
+		} else if e, ok := err.(ErrRemote); r.proto == "udp" && ok && e.ErrorCode() == KRB_ERR_RESPONSE_TOO_BIG {
 			r.nonce = 0
 			r.proto = "tcp"
 			r.sock.Close()

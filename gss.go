@@ -5,9 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/asn1"
 	"encoding/binary"
-	"fmt"
 	"io"
-	"math"
 	"time"
 )
 
@@ -29,34 +27,28 @@ type gssRequest struct {
 
 var gssRequestParam = "application,tag:0"
 
-func encodeGSSWrapper(oid asn1.ObjectIdentifier, data []byte) ([]byte, error) {
+func mustEncodeGSSWrapper(oid asn1.ObjectIdentifier, data []byte) []byte {
 	req := gssRequest{
 		Mechanism: oid,
 		Data:      asn1.RawValue{FullBytes: data},
 	}
 
-	return asn1.MarshalWithParams(req, gssRequestParam)
+	return mustMarshal(req, gssRequestParam)
 }
 
-func decodeGSSWrapper(data []byte) (oid asn1.ObjectIdentifier, idata []byte, err error) {
-	if len(data) < 2 {
-		err = ErrParse
-		return
-	}
+func mustDecodeGSSWrapper(data []byte) (asn1.ObjectIdentifier, []byte) {
+	must(len(data) >= 2)
 
 	// GSS wrappers are optional, if they are not supplied we assume the data is KRB5
 	if data[0] != 0x60 {
-		return gssKrb5Oid, data, nil
+		return gssKrb5Oid, data
 	}
 
 	isz := int(data[1])
 	data = data[2:]
 
 	// Note for the long forms, the data len must be >= 0x80 anyways
-	if isz > len(data) {
-		err = ErrParse
-		return
-	}
+	must(isz <= len(data))
 
 	switch {
 	case isz == 0x84:
@@ -79,19 +71,20 @@ func decodeGSSWrapper(data []byte) (oid asn1.ObjectIdentifier, idata []byte, err
 		// short length form
 
 	default:
-		err = ErrParse
-		return
+		errpanic(ErrProtocol)
 	}
 
-	if isz < 0 || isz > len(data) {
-		err = ErrParse
-		return
-	}
-
+	must(0 <= isz && isz <= len(data))
 	data = data[:isz]
-	oid = asn1.ObjectIdentifier{}
-	idata, err = asn1.Unmarshal(data, &oid)
-	return
+
+	oid := asn1.ObjectIdentifier{}
+	data, err := asn1.Unmarshal(data, &oid)
+
+	if err != nil {
+		errpanic(err)
+	}
+
+	return oid, data
 }
 
 type replayKey struct {
@@ -102,9 +95,11 @@ type replayKey struct {
 	sequenceNumber uint32
 }
 
-func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
+func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err error) {
+	defer recoverMust(&err)
+
 	appflags := 0
-	gssflags := 0
+	gssflags := gssIntegrity | gssConfidential
 
 	if (flags & MutualAuth) != 0 {
 		appflags |= mutualAuth
@@ -120,12 +115,12 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 		gssflags |= gssSequence
 	}
 
-	if (flags & NoConfidentiality) == 0 {
-		gssflags |= gssConfidential
+	if (flags & NoConfidentiality) != 0 {
+		gssflags &^= gssConfidential
 	}
 
-	if (flags & NoIntegrity) == 0 {
-		gssflags |= gssIntegrity
+	if (flags & NoSecurity) == 0 {
+		gssflags &^= gssConfidential | gssIntegrity
 	}
 
 	// See RFC4121 4.1.1 for the GSS fake auth checksum
@@ -150,11 +145,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 	// 28..(n-1) Deleg: A KRB_CRED message (n = Dlgth + 28) [optional]
 	// n..last Exts: Extensions [optional].
 
-	subkey, err := generateKey(rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-
+	subkey := mustGenerateKey(rand.Reader)
 	now := time.Now()
 	auth := authenticator{
 		ProtoVersion:   kerberosVersion,
@@ -170,13 +161,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 		},
 	}
 
-	fmt.Printf("APP_REQUEST auth %+v\n\n", auth)
-
-	authdata, err := asn1.MarshalWithParams(auth, authenticatorParam)
-	if err != nil {
-		return nil, err
-	}
-
+	authdata := mustMarshal(auth, authenticatorParam)
 	req := appRequest{
 		ProtoVersion: kerberosVersion,
 		MsgType:      appRequestType,
@@ -188,20 +173,10 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 		},
 	}
 
-	reqdata, err := asn1.MarshalWithParams(req, appRequestParam)
-	if err != nil {
-		return nil, err
-	}
-
+	reqdata := mustMarshal(req, appRequestParam)
 	reqdata = append([]byte{(gssAppRequest >> 8) & 0xFF, gssAppRequest & 0xFF}, reqdata...)
-	gssdata, err := encodeGSSWrapper(gssKrb5Oid, reqdata)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := rw.Write(gssdata); err != nil {
-		return nil, err
-	}
+	gssdata := mustEncodeGSSWrapper(gssKrb5Oid, reqdata)
+	mustWrite(rw, gssdata)
 
 	// Now get the reply
 
@@ -210,60 +185,31 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 	}
 
 	brep := [4096]byte{}
-	n, err := rw.Read(brep[:])
-	if err != nil {
-		return nil, err
-	}
-
-	oid, repdata, err := decodeGSSWrapper(brep[:n])
-	if err != nil {
-		return nil, err
-	}
-
-	if !oid.Equal(gssKrb5Oid) || len(repdata) < 2 {
-		return nil, ErrProtocol
-	}
+	repdata := mustRead(rw, brep[:])
+	oid, repdata := mustDecodeGSSWrapper(repdata)
+	must(oid.Equal(gssKrb5Oid) && len(repdata) >= 2)
 
 	gsstype := binary.BigEndian.Uint16(repdata[:2])
 
 	switch gsstype {
 	case gssAppError:
 		errmsg := errorMessage{}
-		if _, err := asn1.UnmarshalWithParams(repdata[2:], &errmsg, errorParam); err != nil {
-			return nil, err
-		}
-		return nil, RemoteError{&errmsg}
-
+		mustUnmarshal(repdata[2:], &errmsg, errorParam)
+		return nil, ErrRemote{&errmsg}
 	case gssAppReply:
 		// continue below
 	default:
-		return nil, ErrProtocol
+		errpanic(ErrProtocol)
 	}
 
 	rep := appReply{}
-	if _, err := asn1.UnmarshalWithParams(repdata[2:], &rep, appReplyParam); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("APP_REPLY %+v\n\n", rep)
-	if rep.ProtoVersion != kerberosVersion || rep.MsgType != appReplyType {
-		return nil, ErrProtocol
-	}
-
-	edata, err := t.key.Decrypt(rep.Encrypted.Data, nil, rep.Encrypted.Algo, appReplyEncryptedKey)
-	if err != nil {
-		return nil, err
-	}
+	mustUnmarshal(repdata[2:], &rep, appReplyParam)
+	must(rep.ProtoVersion == kerberosVersion && rep.MsgType == appReplyType)
 
 	erep := encryptedAppReply{}
-	if _, err := asn1.UnmarshalWithParams(edata, &erep, encAppReplyParam); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("APP_REPLY enc %+v\n\n", erep)
-	if !erep.ClientTime.Equal(auth.Time) || erep.ClientMicroseconds != auth.Microseconds {
-		return nil, ErrProtocol
-	}
+	edata := mustDecrypt(t.key, rep.Encrypted.Data, nil, rep.Encrypted.Algo, appReplyEncryptedKey)
+	mustUnmarshal(edata, &erep, encAppReplyParam)
+	must(erep.ClientTime.Equal(auth.Time) && erep.ClientMicroseconds == auth.Microseconds)
 
 	// Now non-SASL requests eg HTTP negotiate are finished.
 	if (flags & SASLAuth) == 0 {
@@ -272,13 +218,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 
 	key := t.key
 	if erep.SubKey.Algo != 0 {
-		fmt.Printf("prevkey %d %x\n", key.EncryptAlgo(appReplyEncryptedKey), key.Key())
-		fmt.Printf("subkey %d %x\n", erep.SubKey.Algo, erep.SubKey.Key)
-		key, err = loadKey(erep.SubKey.Algo, erep.SubKey.Key)
-		if err != nil {
-			panic(err)
-			return nil, err
-		}
+		key = mustLoadKey(erep.SubKey.Algo, erep.SubKey.Key)
 	}
 
 	// SASL requests on the otherhand GSS_wrap all messages from now on.
@@ -287,7 +227,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 	// specific the sasl flags as well as the max wrap size. The server
 	// starts this exchange. Both of these intial messages are not encrypted.
 
-	g := gssWrapper{
+	g := &gssWrapper{
 		// add some extra room for GSS_wrap header and GSS fake ASN1 wrapper
 		rxbuf:    make([]byte, maxGSSWrapRead+64),
 		rxseqnum: erep.SequenceNumber,
@@ -299,38 +239,27 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (io.ReadWriter, error) {
 		rw:       rw,
 	}
 
-	if n, err := g.Read(brep[:]); err != nil {
-		panic(err)
-		return nil, err
-	} else if n != 4 {
-		panic(ErrProtocol)
-		return nil, ErrProtocol
-	}
+	repdata = mustRead(g, brep[:])
+	must(len(repdata) == 4)
 
-	availsec := int(brep[0])
-	g.maxtxsize = int(binary.BigEndian.Uint32(brep[:4]) & 0xFFFFFF)
+	availsec := int(repdata[0])
+	g.maxtxsize = int(binary.BigEndian.Uint32(repdata) & 0xFFFFFF)
 
 	sec := chooseGSSSecurity(availsec, flags)
-	if sec == 0 {
-		panic(ErrProtocol)
-		return nil, ErrProtocol
-	}
+	must(sec != 0)
 
 	grep := [4]byte{}
 	binary.BigEndian.PutUint32(grep[:], maxGSSWrapRead)
 	grep[0] = byte(sec)
 
-	if _, err := g.Write(grep[:]); err != nil {
-		panic(err)
-		return nil, err
-	}
+	mustWrite(g, grep[:])
 
 	if sec == saslNoSecurity {
 		return nil, nil
 	}
 
 	g.conf = (sec == saslConfidential)
-	return &g, nil
+	return g, nil
 }
 
 type gssWrapper struct {
@@ -343,45 +272,43 @@ type gssWrapper struct {
 	rw                 io.ReadWriter
 }
 
-func (s *gssWrapper) Read(b []byte) (int, error) {
-	n, err := s.rw.Read(s.rxbuf)
-	if err != nil {
-		panic(err)
-		return 0, err
+func direction(senderIsInitiator bool) uint32 {
+	if senderIsInitiator {
+		return 0
 	}
 
-	seqnum, gdata, err := gss_unwrap(s.rxbuf[:n], s.key, s.client, s.conf)
-	if err != nil {
-		panic(err)
-		return 0, err
-	}
+	return 0xFFFFFFFF
+}
 
-	if s.checkseq && seqnum != s.rxseqnum {
-		return 0, ErrProtocol
-	}
+func (s *gssWrapper) Read(b []byte) (n int, err error) {
+	defer recoverMust(&err)
 
-	s.rxseqnum++
+	dir := direction(!s.client)
+	data := mustRead(s.rw, s.rxbuf)
+	seqnum, gdata := mustGSSUnwrap(data, s.key, dir, s.conf)
+
+	if s.checkseq {
+		must(seqnum == s.rxseqnum)
+		s.rxseqnum++
+	}
 
 	return copy(b, gdata), nil
 }
 
-func (s *gssWrapper) Write(b []byte) (int, error) {
-	for n := 0; n < len(b); n += s.maxtxsize {
+func (s *gssWrapper) Write(b []byte) (n int, err error) {
+	defer recoverMust(&err)
+
+	for n = 0; n < len(b); n += s.maxtxsize {
 		d := b[n:]
 		if len(d) > s.maxtxsize {
 			d = d[:s.maxtxsize]
 		}
 
-		gdata, err := gss_wrap(s.txseqnum, d, s.key, s.client, s.conf)
-		s.txseqnum++
-		if err != nil {
-			return n, err
-		}
+		dir := direction(s.client)
+		gdata := mustGSSWrap(s.txseqnum, d, s.key, dir, s.conf)
+		mustWrite(s.rw, gdata)
 
-		_, err = s.rw.Write(gdata)
-		if err != nil {
-			return n, err
-		}
+		s.txseqnum++
 	}
 
 	return len(b), nil
@@ -390,8 +317,8 @@ func (s *gssWrapper) Write(b []byte) (int, error) {
 func chooseGSSSecurity(avail, flags int) int {
 	rconf := (flags & RequireConfidentiality) != 0
 	rint := (flags & RequireIntegrity) != 0
-	tconf := (flags & NoConfidentiality) == 0
-	tint := (flags & NoIntegrity) == 0
+	tconf := (flags & (NoConfidentiality | NoSecurity)) == 0
+	tint := (flags & NoSecurity) == 0
 
 	aconf := (avail & saslConfidential) != 0
 	aint := (avail & saslIntegrity) != 0
@@ -417,22 +344,11 @@ func chooseGSSSecurity(avail, flags int) int {
 }
 
 // See RFC1964 1.2.2
-func gss_unwrap(gdata []byte, key cipher, client, conf bool) (seqnum uint32, data []byte, err error) {
-	if len(gdata) < 2 {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
+func mustGSSUnwrap(gdata []byte, key cipher, dir uint32, conf bool) (seqnum uint32, data []byte) {
+	must(len(gdata) >= 2)
 
-	oid, idata, err := decodeGSSWrapper(gdata)
-	if err != nil {
-		panic(err)
-		return 0, nil, err
-	}
-
-	if !oid.Equal(gssKrb5Oid) || len(idata) < 32 {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
+	oid, idata := mustDecodeGSSWrapper(gdata)
+	must(oid.Equal(gssKrb5Oid) && len(idata) >= 32)
 
 	tok := int(binary.BigEndian.Uint16(idata[0:2]))
 	signalg := int(binary.BigEndian.Uint16(idata[2:4]))
@@ -442,78 +358,34 @@ func gss_unwrap(gdata []byte, key cipher, client, conf bool) (seqnum uint32, dat
 	chk := idata[16:24]
 	data = idata[24:]
 
-	if tok != gssWrap {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
-
-	if (sealalg != gssSealNone) != conf {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
+	must(tok == gssWrap)
+	must((sealalg != gssSealNone) == conf)
 
 	// checksum salt
-	seqdata, err = key.Decrypt(seqdata, chk, sealalg, gssSequenceNumber)
-	if err != nil {
-		panic(err)
-		return 0, nil, err
-	}
-	fmt.Printf("gss_unwrap %x\n", idata)
+	seqdata = mustDecrypt(key, seqdata, chk, sealalg, gssSequenceNumber)
 
 	if conf {
 		// sequence number salt
-		if client {
-			data, err = key.Decrypt(data, seqdata[:4], sealalg, gssAcceptorSeal)
-		} else {
-			data, err = key.Decrypt(data, seqdata[:4], sealalg, gssInitiatorSeal)
-		}
-
-		if err != nil {
-			panic(err)
-			return 0, nil, err
-		}
+		data = mustDecrypt(key, data, seqdata[:4], sealalg, gssWrapSeal)
 	}
 
-	var chk2 []byte
-	if client {
-		chk2, err = key.Sign([][]byte{idata[:8], data}, signalg, gssAcceptorSign)
-	} else {
-		chk2, err = key.Sign([][]byte{idata[:8], data}, signalg, gssInitiatorSign)
-	}
-
-	if err != nil {
-		panic(err)
-		return 0, nil, err
-	}
-
-	fmt.Printf("gss_unwrap checksum %x %x\n", chk2, chk)
-	if subtle.ConstantTimeCompare(chk, chk2[:8]) != 1 {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
-
-	dir := binary.BigEndian.Uint32(seqdata[4:8])
-	fmt.Printf("gss_unwrap dir %v %x\n", client, dir)
-	if (client && dir != 0xFFFFFFFF) || (!client && dir != 0) {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
+	chk2 := mustSign(key, [][]byte{idata[:8], data}, signalg, gssWrapSign)
+	must(subtle.ConstantTimeCompare(chk, chk2[:8]) == 1)
+	must(dir == binary.BigEndian.Uint32(seqdata[4:8]))
 
 	// The first 8 bytes of the data is the confounder.
 	// The trailing [1:8] pad bytes all have the padding size as the value
 	padsz := int(data[len(data)-1])
-	if 8+padsz > len(data) {
-		panic(ErrProtocol)
-		return 0, nil, ErrProtocol
-	}
+	must(8+padsz < len(data))
+	data = data[8 : len(data)-padsz]
 
-	return binary.BigEndian.Uint32(seqdata), data[8 : len(data)-padsz], nil
+	return binary.BigEndian.Uint32(seqdata), data
 }
 
 // See RFC1964 1.2.2
-func gss_wrap(seqnum uint32, data []byte, key cipher, client, conf bool) ([]byte, error) {
-	signalgo := key.SignAlgo(gssAcceptorSign)
-	sealalgo := key.EncryptAlgo(gssAcceptorSeal)
+func mustGSSWrap(seqnum uint32, data []byte, key cipher, dir uint32, conf bool) []byte {
+	signalgo := key.SignAlgo(gssWrapSign)
+	sealalgo := key.EncryptAlgo(gssWrapSeal)
 
 	if !conf {
 		sealalgo = gssSealNone
@@ -527,58 +399,37 @@ func gss_wrap(seqnum uint32, data []byte, key cipher, client, conf bool) ([]byte
 	// 8:16 is encrypted sequence number
 	// 16:24 is checksum below
 	binary.BigEndian.PutUint32(d[8:12], seqnum)
-	if client {
-		binary.BigEndian.PutUint32(d[12:16], 0)
-	} else {
-		binary.BigEndian.PutUint32(d[12:16], 0xFFFFFFFF)
-	}
+	binary.BigEndian.PutUint32(d[12:16], dir)
 
 	// 24:32 is the confounder
-	if _, err := io.ReadFull(rand.Reader, d[24:32]); err != nil {
-		return nil, err
-	}
-
+	mustReadFull(rand.Reader, d[24:32])
 	d = append(d, data...)
 
 	// 8 byte round padding must be at least one byte
-	//padsz := ((len(d) + 8) &^ 7) - len(d)
-	padsz := 1
+	padsz := ((len(d) + 8) &^ 7) - len(d)
+
+	// RFC4757 (MS RC4-HMAC) violates the standard padding and wants
+	// explicitely only one byte
+	if key.EncryptAlgo(gssSequenceNumber) == gssSealRC4 {
+		padsz = 1
+	}
+
 	for i := 0; i < padsz; i++ {
 		d = append(d, byte(padsz))
 	}
 
-	var chk []byte
-	var err error
-
-	if client {
-		chk, err = key.Sign([][]byte{d[0:8], d[24:]}, signalgo, gssInitiatorSign)
-	} else {
-		chk, err = key.Sign([][]byte{d[0:8], d[24:]}, signalgo, gssAcceptorSign)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("gss_wrap chksum %x\n", chk)
-
-	copy(d[16:24], chk)
-
-	fmt.Printf("gss_wrap data %x\n", d)
+	// Checksum the 8 byte header, 8 byte confounder, data, and padding
+	copy(d[16:24], mustSign(key, [][]byte{d[0:8], d[24:]}, signalgo, gssWrapSign))
 
 	if conf {
 		// encrypt data using sequence number salt
-		if client {
-			copy(d[24:], key.Encrypt(d[24:], d[8:12], gssInitiatorSeal))
-		} else {
-			copy(d[24:], key.Encrypt(d[24:], d[8:12], gssAcceptorSeal))
-		}
+		copy(d[24:], key.Encrypt(d[24:], d[8:12], gssWrapSeal))
 	}
 
 	// encrypt seqnum using checksum salt
 	copy(d[8:16], key.Encrypt(d[8:16], d[16:24], gssSequenceNumber))
 
-	return encodeGSSWrapper(gssKrb5Oid, d)
+	return mustEncodeGSSWrapper(gssKrb5Oid, d)
 }
 
 func (c *Credential) isReplay(auth *authenticator, etkt *encryptedTicket) bool {
@@ -618,151 +469,92 @@ func (c *Credential) isReplay(auth *authenticator, etkt *encryptedTicket) bool {
 	return false
 }
 
-func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, user, realm string, rerr error) {
+func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, user, realm string, err error) {
 	// TODO send error replies
-	breq := [4096]byte{}
-	n, err := rw.Read(breq[:])
-	if err != nil {
-		rerr = err
-		return
-	}
+	defer recoverMust(&err)
 
-	oid, reqdata, err := decodeGSSWrapper(breq[:n])
-	if err != nil {
-		rerr = err
-		return
-	}
+	// Get the AP_REQ
+	breq := [4096]byte{}
+	reqdata := mustRead(rw, breq[:])
+	oid, reqdata := mustDecodeGSSWrapper(reqdata)
 
 	spnego := oid.Equal(gssSpnegoOid)
 	if spnego {
 		neg := negTokenInit{}
-		if _, err := asn1.UnmarshalWithParams(reqdata, &neg, negTokenInitParam); err != nil {
-			rerr = err
-			return
-		}
-
-		oid, reqdata, err = decodeGSSWrapper(neg.Token)
-		if err != nil {
-			rerr = err
-			return
-		}
+		mustUnmarshal(reqdata, &neg, negTokenInitParam)
+		oid, reqdata = mustDecodeGSSWrapper(neg.Token)
 	}
 
-	if !oid.Equal(gssKrb5Oid) && !oid.Equal(gssMsKrb5Oid) {
-		rerr = ErrProtocol
-		return
-	}
-
-	if len(reqdata) < 2 || binary.BigEndian.Uint16(reqdata[:2]) != gssAppRequest {
-		rerr = ErrProtocol
-		return
-	}
+	must(oid.Equal(gssKrb5Oid) || oid.Equal(gssMsKrb5Oid))
+	must(len(reqdata) >= 2 && binary.BigEndian.Uint16(reqdata[:2]) == gssAppRequest)
 
 	req := appRequest{}
-	if _, err := asn1.UnmarshalWithParams(reqdata[2:], &req, appRequestParam); err != nil {
-		rerr = err
-		return
-	}
+	mustUnmarshal(reqdata[2:], &req, appRequestParam)
+	must(req.ProtoVersion == kerberosVersion && req.MsgType == appRequestType)
 
-	if req.ProtoVersion != kerberosVersion || req.MsgType != appRequestType {
-		rerr = ErrProtocol
-		return
-	}
+	appflags := bitStringToFlags(req.Flags)
 
-	// Check the ticket
+	// Check the ticket - problems with the ticket generate ErrTicket
+	// instead of ErrProtocol so that we can log out that the client just
+	// sent the wrong or an expired ticket (a corrupt ticket still
+	// generates a ErrProtocol though)
 
 	tkt := ticket{}
-	if _, err := asn1.UnmarshalWithParams(req.Ticket.FullBytes, &tkt, ticketParam); err != nil {
-		rerr = err
-		return
+	mustUnmarshal(req.Ticket.FullBytes, &tkt, ticketParam)
+	must(tkt.ProtoVersion == kerberosVersion)
+
+	if tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
+		errpanic(ErrTicket{"wrong service"})
 	}
 
-	if tkt.ProtoVersion != kerberosVersion || tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
-		rerr = ErrInvalidTicket
-		return
-	}
-
-	etktdata, err := c.key.Decrypt(tkt.Encrypted.Data, nil, tkt.Encrypted.Algo, ticketKey)
-	if err != nil {
-		rerr = err
-		return
+	if c.kvno != 0 && c.kvno != tkt.Encrypted.KeyVersion {
+		errpanic(ErrTicket{"wrong key version"})
 	}
 
 	etkt := encryptedTicket{}
-	if _, err := asn1.UnmarshalWithParams(etktdata, &etkt, encTicketParam); err != nil {
-		rerr = err
-		return
-	}
+	etktdata := mustDecrypt(c.key, tkt.Encrypted.Data, nil, tkt.Encrypted.Algo, ticketKey)
+	mustUnmarshal(etktdata, &etkt, encTicketParam)
 
 	now := time.Now()
-	if (etkt.From != time.Time{} && now.Before(etkt.From)) || now.After(etkt.Till) {
-		rerr = ErrInvalidTicket
-		return
+	if etkt.From != *new(time.Time) && now.Before(etkt.From) {
+		errpanic(ErrTicket{"not valid yet"})
+	}
+	if now.After(etkt.Till) {
+		errpanic(ErrTicket{"expired"})
 	}
 
-	tkey, err := loadKey(etkt.Key.Algo, etkt.Key.Key)
-	if err != nil {
-		rerr = err
-		return
-	}
-
-	// Check the authenticator
-
-	authdata, err := tkey.Decrypt(req.Authenticator.Data, nil, req.Authenticator.Algo, appRequestAuthKey)
-	if err != nil {
-		rerr = err
-		return
-	}
-
-	auth := authenticator{}
-	if _, err := asn1.UnmarshalWithParams(authdata, &auth, authenticatorParam); err != nil {
-		rerr = err
-		return
-	}
-
-	if auth.ProtoVersion != kerberosVersion || auth.ClientRealm != etkt.ClientRealm || !nameEquals(auth.Client, etkt.Client) {
-		rerr = ErrProtocol
-		return
-	}
-
-	if math.Abs(float64(now.Sub(auth.Time))) > float64(time.Minute*5) {
-		rerr = ErrProtocol
-		return
-	}
-
-	if auth.Checksum.Algo != gssFakeChecksum || len(auth.Checksum.Data) < 4 {
-		rerr = ErrProtocol
-		return
-	}
-
-	bndlen := int(binary.LittleEndian.Uint32(auth.Checksum.Data))
-	if bndlen < 0 || bndlen + 8 > len(auth.Checksum.Data) {
-		rerr = ErrProtocol
-		return
-	}
-	gssflags := binary.LittleEndian.Uint32(auth.Checksum.Data[bndlen+4:])
-	// TODO: handle forwarded credentials
-
-	appflags := bitStringToFlags(req.Flags)
-	if ((gssflags & gssMutual) != 0) != ((appflags & mutualAuth) != 0) {
-		rerr = ErrProtocol
-		return
-	}
-
-	// Now check for replays
-	if c.isReplay(&auth, &etkt) {
-		rerr = ErrProtocol
-		return
-	}
-
+	tkey := mustLoadKey(etkt.Key.Algo, etkt.Key.Key)
 	user = composePrincipal(etkt.Client)
 	realm = etkt.ClientRealm
 
-	if (appflags & mutualAuth) == 0 {
-		return
-	}
+	// Check the authenticator
+
+	auth := authenticator{}
+	authdata := mustDecrypt(tkey, req.Authenticator.Data, nil, req.Authenticator.Algo, appRequestAuthKey)
+	mustUnmarshal(authdata, &auth, authenticatorParam)
+
+	must(auth.ProtoVersion == kerberosVersion)
+	must(auth.ClientRealm == etkt.ClientRealm && nameEquals(auth.Client, etkt.Client))
+	must(-5*time.Minute < now.Sub(auth.Time) && now.Sub(auth.Time) < 5*time.Minute)
+
+	// Check the fake checksum.
+	// TODO: handle forwarded credentials
+	must(auth.Checksum.Algo == gssFakeChecksum && len(auth.Checksum.Data) >= 4)
+
+	bndlen := int(binary.LittleEndian.Uint32(auth.Checksum.Data))
+	must(0 <= bndlen && bndlen+8 <= len(auth.Checksum.Data))
+
+	gssflags := binary.LittleEndian.Uint32(auth.Checksum.Data[bndlen+4:])
+	must(((gssflags & gssMutual) != 0) == ((appflags & mutualAuth) != 0))
+
+	// Now check for replays
+	must(!c.isReplay(&auth, &etkt))
 
 	// Now send the reply
+
+	if (appflags & mutualAuth) == 0 {
+		return nil, user, realm, nil
+	}
 
 	erep := encryptedAppReply{
 		ClientTime:         auth.Time,
@@ -770,68 +562,36 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 		SequenceNumber:     nextSequenceNumber(),
 	}
 
-	edata, err := asn1.MarshalWithParams(erep, encAppReplyParam)
-	if err != nil {
-		rerr = err
-		return
-	}
-
+	erepdata := mustMarshal(erep, encAppReplyParam)
 	rep := appReply{
 		ProtoVersion: kerberosVersion,
 		MsgType:      appReplyType,
 		Encrypted: encryptedData{
 			Algo: tkey.EncryptAlgo(appReplyEncryptedKey),
-			Data: tkey.Encrypt(edata, nil, appReplyEncryptedKey),
+			Data: tkey.Encrypt(erepdata, nil, appReplyEncryptedKey),
 		},
 	}
 
-	repdata, err := asn1.MarshalWithParams(rep, appReplyParam)
-	if err != nil {
-		rerr = err
-		return
-	}
-
+	repdata := mustMarshal(rep, appReplyParam)
 	repdata = append([]byte{(gssAppReply >> 8) & 0xFF, gssAppReply & 0xFF}, repdata...)
-	gssrep, err := encodeGSSWrapper(oid, repdata)
-	if err != nil {
-		rerr = err
-		return
-	}
+	repdata = mustEncodeGSSWrapper(oid, repdata)
 
 	if spnego {
 		srep := negTokenReply{
 			State:     spnegoAccepted,
 			Mechanism: oid,
-			Response:  gssrep,
+			Response:  repdata,
 		}
 
-		repdata, err := asn1.MarshalWithParams(srep, negTokenReplyParam)
-		if err != nil {
-			rerr = err
-			return
-		}
-
-		gssrep, err = encodeGSSWrapper(gssSpnegoOid, repdata)
-		if err != nil {
-			rerr = err
-			return
-		}
+		repdata = mustMarshal(srep, negTokenReplyParam)
+		repdata = mustEncodeGSSWrapper(gssSpnegoOid, repdata)
 	}
 
-	if _, err := rw.Write(gssrep); err != nil {
-		rerr = err
-		return
-	}
+	mustWrite(rw, repdata)
 
 	// Non-SASL accepts eg HTTP negotiate are now finished
 	if (flags & SASLAuth) == 0 {
-		return
-	}
-
-	// We need to be able to do further handshakes
-	if (gssflags & gssProtectionReady) == 0 {
-		rerr = ErrProtocol
-		return
+		return nil, user, realm, nil
 	}
 
 	// SASL accept continues on with sending a GSS_wrapped request from
@@ -843,8 +603,8 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	if (flags & NoConfidentiality) != 0 {
 		availsec &^= saslConfidential
 	}
-	if (flags & NoIntegrity) != 0 {
-		availsec &^= saslIntegrity
+	if (flags & NoSecurity) != 0 {
+		availsec &^= saslIntegrity | saslConfidential
 	}
 
 	// Remove modes where we require a higher level
@@ -863,11 +623,10 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	}
 
 	if availsec == 0 {
-		rerr = ErrNoAvailableSecurity
-		return
+		errpanic(ErrNoAvailableSecurity)
 	}
 
-	g := gssWrapper{
+	g := &gssWrapper{
 		// add some extra room for GSS_wrap header and GSS fake ASN1 wrapper
 		rxbuf:     make([]byte, maxGSSWrapRead+64),
 		rxseqnum:  auth.SequenceNumber,
@@ -884,35 +643,25 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	binary.BigEndian.PutUint32(gd[:], maxGSSWrapRead)
 	gd[0] = byte(availsec)
 
-	if _, err := g.Write(gd[:]); err != nil {
-		rerr = err
-		return
-	}
+	mustWrite(g, gd[:])
 
-	if n, err := g.Read(gd[:]); err != nil {
-		rerr = err
-		return
-	} else if n != 4 {
-		rerr = ErrProtocol
-		return
-	}
+	repdata = mustRead(g, gd[:])
+	must(len(repdata) == 4)
 
-	g.maxtxsize = int(binary.BigEndian.Uint32(gd[:]) & 0xFFFFFF)
+	g.maxtxsize = int(binary.BigEndian.Uint32(repdata) & 0xFFFFFF)
 
-	switch gd[0] {
+	sec := int(repdata[0])
+	must((sec & availsec) != 0)
+
+	switch sec {
 	case saslNoSecurity:
-		return
-
+		g = nil
 	case saslIntegrity:
-		gssrw = &g
-		return
-
 	case saslConfidential:
 		g.conf = true
-		gssrw = &g
-		return
+	default:
+		errpanic(ErrProtocol)
 	}
 
-	rerr = ErrProtocol
-	return
+	return g, user, realm, nil
 }

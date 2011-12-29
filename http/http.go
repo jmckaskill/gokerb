@@ -60,7 +60,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	tkt, err := t.Credential.GetTicket(service, "", time.Now().Add(TicketLifetime), TicketFlags)
+	tkt, err := t.Credential.GetTicket(service, time.Now().Add(TicketLifetime), TicketFlags)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +163,7 @@ func (a *Authenticator) doBasicAuth(w http.ResponseWriter, r *http.Request, auth
 	}
 
 	cred := kerb.NewCredential(user, realm, string(auth[i+1:]))
-	tkt, err := cred.GetTicket(a.cred.Principal(), a.cred.Realm(), time.Now().Add(TicketLifetime), TicketFlags)
+	tkt, err := cred.GetTicket(a.cred.Principal(), time.Now().Add(TicketLifetime), TicketFlags)
 	if err != nil {
 		return a.fail(w, r, err)
 	}

@@ -10,10 +10,6 @@ import (
 	"encoding/binary"
 	"io"
 	"unicode/utf16"
-
-	"encoding/hex"
-	"encoding/asn1"
-	"fmt"
 )
 
 type cipher interface {
@@ -28,8 +24,24 @@ type cipher interface {
 	Key() []byte
 }
 
+func mustSign(key cipher, data [][]byte, algo, usage int) []byte {
+	sign, err := key.Sign(data, algo, usage)
+	if err != nil {
+		errpanic(err)
+	}
+	return sign
+}
+
+func mustDecrypt(key cipher, data, salt []byte, algo, usage int) []byte {
+	dec, err := key.Decrypt(data, salt, algo, usage)
+	if err != nil {
+		errpanic(err)
+	}
+	return dec
+}
+
 type rc4HmacCipher struct {
-	key  []byte
+	key []byte
 }
 
 // rc4HmacKey converts a UTF8 password into a key suitable for use with the
@@ -56,7 +68,7 @@ func rc4HmacUsage(usage int) uint32 {
 	switch usage {
 	case asReplyClientKey:
 		return 8
-	case gssInitiatorSign, gssAcceptorSign:
+	case gssWrapSign:
 		return 13
 	}
 
@@ -65,7 +77,7 @@ func rc4HmacUsage(usage int) uint32 {
 
 func (c *rc4HmacCipher) EncryptAlgo(usage int) int {
 	switch usage {
-	case gssAcceptorSeal, gssInitiatorSeal, gssSequenceNumber:
+	case gssWrapSeal, gssSequenceNumber:
 		return gssSealRC4
 	}
 
@@ -78,7 +90,7 @@ func (c *rc4HmacCipher) Key() []byte {
 
 func (c *rc4HmacCipher) SignAlgo(usage int) int {
 	switch usage {
-	case gssAcceptorSign, gssInitiatorSign:
+	case gssWrapSign:
 		return gssSignHMAC_MD5
 	}
 
@@ -129,7 +141,7 @@ func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
 		r.XORKeyStream(data, data)
 		return data
 
-	case gssAcceptorSeal, gssInitiatorSeal:
+	case gssWrapSeal:
 		// salt is the sequence number in big endian
 		seqnum := binary.BigEndian.Uint32(salt)
 		kcrypt := make([]byte, len(c.key))
@@ -184,7 +196,7 @@ func (c *rc4HmacCipher) Decrypt(data, salt []byte, algo, usage int) ([]byte, err
 
 		return c.Encrypt(data, salt, usage), nil
 
-	case gssAcceptorSeal, gssInitiatorSeal:
+	case gssWrapSeal:
 		// GSS sealing uses an external checksum for integrity and
 		// since RC4 is symettric we can just reencrypt the data
 		if algo != gssSealRC4 {
@@ -229,13 +241,13 @@ func (c *rc4HmacCipher) Decrypt(data, salt []byte, algo, usage int) ([]byte, err
 	panic("")
 }
 
-func generateKey(rand io.Reader) (cipher, error) {
+func mustGenerateKey(rand io.Reader) cipher {
 	data := [16]byte{}
 	if _, err := io.ReadFull(rand, data[:]); err != nil {
-		return nil, err
+		errpanic(err)
 	}
 
-	return loadKey(rc4HmacAlgorithm, data[:])
+	return mustLoadKey(rc4HmacAlgorithm, data[:])
 }
 
 func loadKey(algorithm int, key []byte) (cipher, error) {
@@ -244,4 +256,12 @@ func loadKey(algorithm int, key []byte) (cipher, error) {
 		return &rc4HmacCipher{key}, nil
 	}
 	return nil, ErrProtocol
+}
+
+func mustLoadKey(algo int, key []byte) cipher {
+	c, err := loadKey(algo, key)
+	if err != nil {
+		errpanic(err)
+	}
+	return c
 }

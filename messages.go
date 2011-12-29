@@ -4,6 +4,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"errors"
+	"io"
 	"strings"
 	"time"
 )
@@ -170,10 +171,8 @@ const (
 	_
 	_
 	_
-	gssAcceptorSeal
-	gssAcceptorSign
-	gssInitiatorSeal
-	gssInitiatorSign
+	gssWrapSeal
+	gssWrapSign
 
 	gssSequenceNumber = -1
 )
@@ -184,14 +183,14 @@ const (
 	udpReadTimeout       = 3e9
 	defaultLoginDuration = time.Hour * 24
 	maxUDPWrite          = 1400 // TODO: figure out better way of doing this
-	maxGSSWrapRead       = 64 * 1024
+	maxGSSWrapRead       = 64 * 1024 // TODO: remove this as a limitation
+	maxPDUSize           = 4 * 1024
 )
 
 var (
 	ErrParse               = errors.New("kerb: parse error")
 	ErrProtocol            = errors.New("kerb: protocol error")
 	ErrAuthLoop            = errors.New("kerb: auth loop")
-	ErrInvalidTicket       = errors.New("kerb: invalid or expired ticket")
 	ErrPassword            = errors.New("kerb: can't renew the main krbtgt ticket as the password is unknown")
 	ErrNoAvailableSecurity = errors.New("kerb: no available SASL security mode")
 
@@ -220,12 +219,26 @@ var (
 	gssSpnegoOid  = asn1.ObjectIdentifier([]int{1, 3, 6, 1, 5, 5, 2})
 )
 
+type ErrInvalidProto string
+
+func (s ErrInvalidProto) Error() string {
+	return "kerb: invalid protocol - " + string(s)
+}
+
+type ErrTicket struct {
+	reason string
+}
+
+func (s ErrTicket) Error() string {
+	return "kerb: invalid ticket - " + s.reason
+}
+
 // Flags for tkt.Connect and tkt.Accept
 const (
 	MutualAuth = 1 << iota
 	SASLAuth
 	NoConfidentiality
-	NoIntegrity
+	NoSecurity
 	RequireConfidentiality
 	RequireIntegrity
 )
@@ -517,3 +530,66 @@ func flagsToBitString(flags int) (s asn1.BitString) {
 	binary.BigEndian.PutUint32(s.Bytes, uint32(flags))
 	return
 }
+
+func must(cond bool) {
+	if !cond {
+		errpanic(ErrProtocol)
+	}
+}
+
+func mustMarshal(val interface{}, params string) []byte {
+	data, err := asn1.MarshalWithParams(val, params)
+	if err != nil {
+		errpanic(err)
+	}
+	return data
+}
+
+func mustUnmarshal(data []byte, val interface{}, params string) {
+	left, err := asn1.UnmarshalWithParams(data, val, params)
+	if err != nil {
+		errpanic(err)
+	}
+	if len(left) > 0 {
+		errpanic(ErrProtocol)
+	}
+}
+
+func mustRead(r io.Reader, buf []byte) []byte {
+	n, err := r.Read(buf)
+	if err != nil {
+		errpanic(err)
+	}
+	return buf[:n]
+}
+
+func mustReadFull(r io.Reader, buf []byte) {
+	if _, err := io.ReadFull(r, buf); err != nil {
+		errpanic(err)
+	}
+}
+
+func mustWrite(w io.Writer, buf []byte) {
+	if _, err := w.Write(buf); err != nil {
+		errpanic(err)
+	}
+}
+
+func errpanic(err error) {
+	panic(err)
+}
+
+func recoverMust(perr *error) {
+	v := recover()
+	if v == nil {
+		return
+	}
+
+	err, ok := v.(error)
+	if !ok {
+		panic(v)
+	}
+
+	*perr = err
+}
+
