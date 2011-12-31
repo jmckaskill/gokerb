@@ -455,7 +455,7 @@ type errorMessage struct {
 
 type negTokenInit struct {
 	Mechanisms []asn1.ObjectIdentifier `asn1:"explicit,tag:0"`
-	Token      []byte                  `asn1:"explicit,tag:1"`
+	Token      []byte                  `asn1:"explicit,tag:2,optional"`
 }
 
 type negTokenReply struct {
