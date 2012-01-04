@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/jmckaskill/gokerb"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -66,7 +67,13 @@ func splitAuth(h string) (string, []byte, error) {
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	service, err := kerb.ResolveService("HTTP", req.URL.Host)
+	// TODO this should use the same lookup as the request
+	addr, err := net.LookupHost(req.URL.Host)
+	if err != nil {
+		return nil, err
+	}
+
+	service, err := kerb.ResolveService("HTTP", addr[0])
 	if err != nil {
 		return nil, err
 	}

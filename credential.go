@@ -49,17 +49,18 @@ import (
 //
 // Host will be converted to the canonical FQDN and appended to service as
 // <service>/<canon fqdn> to create the principal.
-func ResolveService(service, host string) (string, error) {
-	if hpart, _, err := net.SplitHostPort(host); err == nil {
-		host = hpart
-	}
-
-	addrs, err := net.LookupHost(host)
+//
+// Addr must already be resolved to an IP address eg with
+// net.Conn.RemoteAddr.String. This is required because service names are
+// specific to an individual server whereas DNS names may resolve to multiple
+// different servers.
+func ResolveService(service, addr string) (string, error) {
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		return "", err
+		host = addr
 	}
 
-	names, err := net.LookupAddr(addrs[0])
+	names, err := net.LookupAddr(host)
 	if err != nil {
 		return "", err
 	}
