@@ -151,13 +151,13 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 	// n..last Exts: Extensions [optional].
 
 	subkey := mustGenerateKey(rand.Reader)
-	now := time.Now()
+	now := time.Now().UTC()
 	auth := authenticator{
 		ProtoVersion:   kerberosVersion,
 		ClientRealm:    t.crealm,
 		Client:         t.client,
 		SequenceNumber: nextSequenceNumber(),
-		Time:           time.Unix(now.Unix(), 0), // round to the nearest second
+		Time:           time.Unix(now.Unix(), 0).UTC(), // round to the nearest second
 		Microseconds:   now.Nanosecond() / 1000,
 		Checksum:       checksumData{gssFakeChecksum, gsschk[:]},
 		SubKey: encryptionKey{
@@ -438,7 +438,7 @@ func mustGSSWrap(seqnum uint32, data []byte, key cipher, dir uint32, conf bool) 
 }
 
 func (c *Credential) isReplay(auth *authenticator, etkt *encryptedTicket) bool {
-	now := time.Now()
+	now := time.Now().UTC()
 
 	c.lk.Lock()
 	defer c.lk.Unlock()
@@ -529,7 +529,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	etktdata := mustDecrypt(c.key, tkt.Encrypted.Data, nil, tkt.Encrypted.Algo, ticketKey)
 	mustUnmarshal(etktdata, &etkt, encTicketParam)
 
-	now := time.Now()
+	now := time.Now().UTC()
 	if etkt.From != *new(time.Time) && now.Before(etkt.From) {
 		errpanic(ErrTicket{"not valid yet"})
 	}

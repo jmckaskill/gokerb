@@ -56,7 +56,7 @@ func (r *request) sendRequest() (err error) {
 		ServiceRealm: r.srealm,
 		Service:      r.service,
 		Flags:        flagsToBitString(r.flags),
-		Till:         r.till,
+		Till:         r.till.UTC(),
 		Nonce:        r.nonce,
 		Algorithms:   supportedAlgorithms,
 	}
@@ -85,7 +85,7 @@ func (r *request) sendRequest() (err error) {
 			Client:         r.client,
 			Microseconds:   r.time.Nanosecond() / 1000,
 			SequenceNumber: r.seqnum,
-			Time:           r.time,
+			Time:           time.Unix(r.time.Unix(), 0).UTC(), // round to the nearest second
 			Checksum:       checksumData{calgo, chk},
 		}
 
@@ -327,7 +327,7 @@ func (r *request) do() (tkt *Ticket, err error) {
 				return nil, err
 			}
 			r.nonce >>= 1
-			r.time = time.Now()
+			r.time = time.Now().UTC()
 			r.seqnum = nextSequenceNumber()
 		}
 
