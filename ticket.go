@@ -40,6 +40,7 @@ type request struct {
 	seqnum uint32
 	sock   net.Conn
 	proto  string
+	subkey cipher
 }
 
 // sendRequest sends a single ticket request down the sock writer. If r.tgt is
@@ -87,6 +88,10 @@ func (r *request) sendRequest() (err error) {
 			SequenceNumber: r.seqnum,
 			Time:           time.Unix(r.time.Unix(), 0).UTC(), // round to the nearest second
 			Checksum:       checksumData{calgo, chk},
+			SubKey: encryptionKey{
+				Algo: r.subkey.EncryptAlgo(tgsReplySubKey),
+				Key:  r.subkey.Key(),
+			},
 		}
 
 		authdata := mustMarshal(auth, authenticatorParam)
@@ -193,8 +198,8 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 	if r.tgt != nil {
 		repparam = tgsReplyParam
 		msgtype = tgsReplyType
-		key = r.tgt.key
-		usage = tgsReplySessionKey
+		key = r.subkey
+		usage = tgsReplySubKey
 		encparam = encTgsReplyParam
 	} else {
 		repparam = asReplyParam
@@ -329,6 +334,7 @@ func (r *request) do() (tkt *Ticket, err error) {
 			r.nonce >>= 1
 			r.time = time.Now().UTC()
 			r.seqnum = nextSequenceNumber()
+			r.subkey = mustGenerateKey(rand.Reader)
 		}
 
 		// TODO what error do we get if the tcp socket has been closed underneath us
