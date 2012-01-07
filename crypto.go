@@ -1,6 +1,7 @@
 package kerb
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/md4"
 	"crypto/md5"
@@ -14,26 +15,26 @@ import (
 
 type cipher interface {
 	// If algo is -1 then use the default
-	Sign(data [][]byte, algo, usage int) ([]byte, error)
+	Sign(algo, usage int, data ...[]byte) ([]byte, error)
 	SignAlgo(usage int) int
 
-	Encrypt(data, salt []byte, usage int) []byte
-	Decrypt(data, salt []byte, algo, usage int) ([]byte, error)
+	Encrypt(salt []byte, usage int, data ...[]byte) []byte
+	Decrypt(salt []byte, algo, usage int, data []byte) ([]byte, error)
 	EncryptAlgo(usage int) int
 
 	Key() []byte
 }
 
-func mustSign(key cipher, data [][]byte, algo, usage int) []byte {
-	sign, err := key.Sign(data, algo, usage)
+func mustSign(key cipher, algo, usage int, data ...[]byte) []byte {
+	sign, err := key.Sign(algo, usage, data...)
 	if err != nil {
 		errpanic(err)
 	}
 	return sign
 }
 
-func mustDecrypt(key cipher, data, salt []byte, algo, usage int) []byte {
-	dec, err := key.Decrypt(data, salt, algo, usage)
+func mustDecrypt(key cipher, salt []byte, algo, usage int, data []byte) []byte {
+	dec, err := key.Decrypt(salt, algo, usage, data)
 	if err != nil {
 		errpanic(err)
 	}
@@ -101,7 +102,7 @@ func (c *rc4HmacCipher) SignAlgo(usage int) int {
 
 var signaturekey = []byte("signaturekey\x00")
 
-func (c *rc4HmacCipher) Sign(data [][]byte, algo, usage int) ([]byte, error) {
+func (c *rc4HmacCipher) Sign(algo, usage int, data ...[]byte) ([]byte, error) {
 	switch algo {
 	case md5Checksum:
 		h := md5.New()
@@ -129,7 +130,7 @@ func (c *rc4HmacCipher) Sign(data [][]byte, algo, usage int) ([]byte, error) {
 	return nil, ErrProtocol
 }
 
-func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
+func (c *rc4HmacCipher) Encrypt(salt []byte, usage int, data ...[]byte) []byte {
 	switch usage {
 	case gssSequenceNumber:
 		// salt is the checksum
@@ -138,8 +139,10 @@ func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
 		h = hmac.NewMD5(h.Sum(nil))
 		h.Write(salt)
 		r, _ := rc4.NewCipher(h.Sum(nil))
-		r.XORKeyStream(data, data)
-		return data
+		for _, d := range data {
+			r.XORKeyStream(d, d)
+		}
+		return bytes.Join(data, nil)
 
 	case gssWrapSeal:
 		// salt is the sequence number in big endian
@@ -151,12 +154,18 @@ func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
 		h := hmac.NewMD5(kcrypt)
 		binary.Write(h, binary.LittleEndian, seqnum)
 		r, _ := rc4.NewCipher(h.Sum(nil))
-		r.XORKeyStream(data, data)
-		return data
+		for _, d := range data {
+			r.XORKeyStream(d, d)
+		}
+		return bytes.Join(data, nil)
 
 	default:
 		// Create the output vector, layout is 0-15 checksum, 16-23 random data, 24- actual data
-		out := make([]byte, len(data)+24)
+		outsz := 24
+		for _, d := range data {
+			outsz += len(d)
+		}
+		out := make([]byte, outsz)
 		io.ReadFull(rand.Reader, out[16:24])
 
 		// Hash the key and usage together to get the HMAC-MD5 key
@@ -167,7 +176,9 @@ func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
 		// Fill in out[:16] with the checksum
 		ch := hmac.NewMD5(K1)
 		ch.Write(out[16:24])
-		ch.Write(data)
+		for _, d := range data {
+			ch.Write(d)
+		}
 		ch.Sum(out[:0])
 
 		// Calculate the RC4 key using the checksum
@@ -179,7 +190,12 @@ func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
 		// encrypted data
 		r, _ := rc4.NewCipher(K3)
 		r.XORKeyStream(out[16:24], out[16:24])
-		r.XORKeyStream(out[24:], data)
+
+		dst := out[24:]
+		for _, d := range data {
+			r.XORKeyStream(dst[:len(d)], d)
+			dst = dst[len(d):]
+		}
 
 		return out
 	}
@@ -187,14 +203,14 @@ func (c *rc4HmacCipher) Encrypt(data, salt []byte, usage int) []byte {
 	panic("")
 }
 
-func (c *rc4HmacCipher) Decrypt(data, salt []byte, algo, usage int) ([]byte, error) {
+func (c *rc4HmacCipher) Decrypt(salt []byte, algo, usage int, data []byte) ([]byte, error) {
 	switch usage {
 	case gssSequenceNumber:
 		if algo != gssSealRC4 && algo != gssSealNone {
 			return nil, ErrProtocol
 		}
 
-		return c.Encrypt(data, salt, usage), nil
+		return c.Encrypt(salt, usage, data), nil
 
 	case gssWrapSeal:
 		// GSS sealing uses an external checksum for integrity and
@@ -203,7 +219,7 @@ func (c *rc4HmacCipher) Decrypt(data, salt []byte, algo, usage int) ([]byte, err
 			return nil, ErrProtocol
 		}
 
-		return c.Encrypt(data, salt, usage), nil
+		return c.Encrypt(salt, usage, data), nil
 
 	default:
 		if algo != rc4HmacAlgorithm || len(data) < 24 {

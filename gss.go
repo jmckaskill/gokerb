@@ -174,7 +174,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 		Ticket:       asn1.RawValue{FullBytes: t.ticket},
 		Authenticator: encryptedData{
 			Algo: t.key.EncryptAlgo(appRequestAuthKey),
-			Data: t.key.Encrypt(authdata, nil, appRequestAuthKey),
+			Data: t.key.Encrypt(nil, appRequestAuthKey, authdata),
 		},
 	}
 
@@ -212,7 +212,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 	must(rep.ProtoVersion == kerberosVersion && rep.MsgType == appReplyType)
 
 	erep := encryptedAppReply{}
-	edata := mustDecrypt(t.key, rep.Encrypted.Data, nil, rep.Encrypted.Algo, appReplyEncryptedKey)
+	edata := mustDecrypt(t.key, nil, rep.Encrypted.Algo, appReplyEncryptedKey, rep.Encrypted.Data)
 	mustUnmarshal(edata, &erep, encAppReplyParam)
 	must(erep.ClientTime.Equal(auth.Time) && erep.ClientMicroseconds == auth.Microseconds)
 
@@ -367,14 +367,14 @@ func mustGSSUnwrap(gdata []byte, key cipher, dir uint32, conf bool) (seqnum uint
 	must((sealalg != gssSealNone) == conf)
 
 	// checksum salt
-	seqdata = mustDecrypt(key, seqdata, chk, sealalg, gssSequenceNumber)
+	seqdata = mustDecrypt(key, chk, sealalg, gssSequenceNumber, seqdata)
 
 	if conf {
 		// sequence number salt
-		data = mustDecrypt(key, data, seqdata[:4], sealalg, gssWrapSeal)
+		data = mustDecrypt(key, seqdata[:4], sealalg, gssWrapSeal, data)
 	}
 
-	chk2 := mustSign(key, [][]byte{idata[:8], data}, signalg, gssWrapSign)
+	chk2 := mustSign(key, signalg, gssWrapSign, idata[:8], data)
 	must(subtle.ConstantTimeCompare(chk, chk2[:8]) == 1)
 	must(dir == binary.BigEndian.Uint32(seqdata[4:8]))
 
@@ -424,15 +424,15 @@ func mustGSSWrap(seqnum uint32, data []byte, key cipher, dir uint32, conf bool) 
 	}
 
 	// Checksum the 8 byte header, 8 byte confounder, data, and padding
-	copy(d[16:24], mustSign(key, [][]byte{d[0:8], d[24:]}, signalgo, gssWrapSign))
+	copy(d[16:24], mustSign(key, signalgo, gssWrapSign, d[:8], d[24:]))
 
 	if conf {
 		// encrypt data using sequence number salt
-		copy(d[24:], key.Encrypt(d[24:], d[8:12], gssWrapSeal))
+		copy(d[24:], key.Encrypt(d[8:12], gssWrapSeal, d[24:]))
 	}
 
 	// encrypt seqnum using checksum salt
-	copy(d[8:16], key.Encrypt(d[8:16], d[16:24], gssSequenceNumber))
+	copy(d[8:16], key.Encrypt(d[16:24], gssSequenceNumber, d[8:16]))
 
 	return mustEncodeGSSWrapper(gssKrb5Oid, d)
 }
@@ -526,7 +526,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	}
 
 	etkt := encryptedTicket{}
-	etktdata := mustDecrypt(c.key, tkt.Encrypted.Data, nil, tkt.Encrypted.Algo, ticketKey)
+	etktdata := mustDecrypt(c.key, nil, tkt.Encrypted.Algo, ticketKey, tkt.Encrypted.Data)
 	mustUnmarshal(etktdata, &etkt, encTicketParam)
 
 	now := time.Now().UTC()
@@ -544,7 +544,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	// Check the authenticator
 
 	auth := authenticator{}
-	authdata := mustDecrypt(tkey, req.Authenticator.Data, nil, req.Authenticator.Algo, appRequestAuthKey)
+	authdata := mustDecrypt(tkey, nil, req.Authenticator.Algo, appRequestAuthKey, req.Authenticator.Data)
 	mustUnmarshal(authdata, &auth, authenticatorParam)
 
 	must(auth.ProtoVersion == kerberosVersion)
@@ -582,7 +582,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 		MsgType:      appReplyType,
 		Encrypted: encryptedData{
 			Algo: tkey.EncryptAlgo(appReplyEncryptedKey),
-			Data: tkey.Encrypt(erepdata, nil, appReplyEncryptedKey),
+			Data: tkey.Encrypt(nil, appReplyEncryptedKey, erepdata),
 		},
 	}
 

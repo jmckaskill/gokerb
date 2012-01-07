@@ -77,7 +77,7 @@ func (r *request) sendRequest() (err error) {
 		req.MsgType = tgsRequestType
 
 		calgo := r.tgt.key.SignAlgo(paTgsRequestChecksumKey)
-		chk := mustSign(r.tgt.key, [][]byte{bodydata}, calgo, paTgsRequestChecksumKey)
+		chk := mustSign(r.tgt.key, calgo, paTgsRequestChecksumKey, bodydata)
 
 		auth := authenticator{
 			ProtoVersion:   kerberosVersion,
@@ -91,13 +91,13 @@ func (r *request) sendRequest() (err error) {
 
 		authdata := mustMarshal(auth, authenticatorParam)
 		app := appRequest{
-			ProtoVersion:  kerberosVersion,
-			MsgType:       appRequestType,
-			Flags:         flagsToBitString(0),
-			Ticket:        asn1.RawValue{FullBytes: r.tgt.ticket},
+			ProtoVersion: kerberosVersion,
+			MsgType:      appRequestType,
+			Flags:        flagsToBitString(0),
+			Ticket:       asn1.RawValue{FullBytes: r.tgt.ticket},
 			Authenticator: encryptedData{
 				Algo: r.tgt.key.EncryptAlgo(paTgsRequestKey),
-				Data: r.tgt.key.Encrypt(authdata, nil, paTgsRequestKey),
+				Data: r.tgt.key.Encrypt(nil, paTgsRequestKey, authdata),
 			},
 		}
 
@@ -116,7 +116,7 @@ func (r *request) sendRequest() (err error) {
 		tsdata := mustMarshal(encryptedTimestamp{r.time, int(r.seqnum % 1000000)}, "")
 
 		algo := r.ckey.EncryptAlgo(paEncryptedTimestampKey)
-		edata := r.ckey.Encrypt(tsdata, nil, paEncryptedTimestampKey)
+		edata := r.ckey.Encrypt(nil, paEncryptedTimestampKey, tsdata)
 		enc := mustMarshal(encryptedData{algo, r.ckvno, edata}, "")
 
 		req.Preauth = []preauth{{paEncryptedTimestamp, enc}}
@@ -225,7 +225,7 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 
 	// Decode encrypted part
 	enc := encryptedKdcReply{}
-	edata := mustDecrypt(key, rep.Encrypted.Data, nil, rep.Encrypted.Algo, usage)
+	edata := mustDecrypt(key, nil, rep.Encrypted.Algo, usage, rep.Encrypted.Data)
 	mustUnmarshal(edata, &enc, encparam)
 
 	// The returned service may be different from the request. This
