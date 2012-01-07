@@ -24,6 +24,7 @@ func nextSequenceNumber() uint32 {
 }
 
 type request struct {
+	dial    func(proto, realm string) (net.Conn, error)
 	client  principalName
 	crealm  string
 	ckey    cipher // only needed for AS requests when tgt == nil
@@ -267,9 +268,9 @@ type Ticket struct {
 	key       cipher
 }
 
-func open(proto, realm string) (net.Conn, error) {
+func DefaultDial(proto, realm string) (net.Conn, error) {
 	if proto != "tcp" && proto != "udp" {
-		errpanic(ErrInvalidProto(proto))
+		return nil, ErrInvalidProto(proto)
 	}
 
 	_, addrs, err := net.LookupSRV("kerberos", proto, realm)
@@ -320,7 +321,7 @@ func (r *request) do() (tkt *Ticket, err error) {
 	// the last error
 	for i := 0; i < 3; i++ {
 		if r.sock == nil {
-			if r.sock, err = open(r.proto, r.srealm); err != nil {
+			if r.sock, err = r.dial(r.proto, r.srealm); err != nil {
 				break
 			}
 		}

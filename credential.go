@@ -85,6 +85,7 @@ func ResolveService(service, addr string) (string, error) {
 // created from a credential cache as the cache doesn't store the user
 // password in any form.
 type Credential struct {
+	Dial      func(proto, realm string) (net.Conn, error)
 	key       cipher
 	kvno      int
 	principal principalName
@@ -157,6 +158,7 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 
 	// AS_REQ login
 	r := request{
+		dial:    c.Dial,
 		ckey:    c.key,
 		ckvno:   c.kvno,
 		flags:   defaultLoginFlags,
@@ -165,6 +167,10 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 		srealm:  c.realm,
 		client:  c.principal,
 		service: principalName{serviceInstanceType, []string{"krbtgt", c.realm}},
+	}
+
+	if r.dial == nil {
+		r.dial = DefaultDial
 	}
 
 	tgt, err := r.do()
@@ -257,6 +263,7 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 	// either get our service or we cancel due to a loop in the auth path
 	for i := 0; i < 10; i++ {
 		r := request{
+			dial:    c.Dial,
 			client:  c.principal,
 			crealm:  c.realm,
 			service: splitPrincipal(service),
@@ -264,6 +271,10 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 			flags:   flags,
 			till:    till,
 			tgt:     tgt,
+		}
+
+		if r.dial == nil {
+			r.dial = DefaultDial
 		}
 
 		tkt, err := r.do()
