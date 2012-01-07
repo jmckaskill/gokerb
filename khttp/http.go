@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 )
 
 // Transport is a HTTP client transport that authenticates all outgoing
@@ -22,8 +21,6 @@ type Transport struct {
 	Credential *kerb.Credential
 	// Next specifies the next transport to be used or http.DefaultTransport if nil.
 	Next           http.RoundTripper
-	TicketFlags    int
-	TicketLifetime time.Duration
 	// Flags to pass to ticket.Connect. Use kerb.MutualAuth to authenticate the server.
 	ConnectFlags int
 }
@@ -78,12 +75,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	lifetime := t.TicketLifetime
-	if lifetime <= 0 {
-		lifetime = time.Hour
-	}
-
-	tkt, err := t.Credential.GetTicket(service, time.Now().Add(lifetime), t.TicketFlags)
+	tkt, err := t.Credential.GetTicket(service, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -137,8 +129,6 @@ type AuthConfig struct {
 	BasicLookup func(username string) (user, realm string, err error)
 	// BasicRealm is the basic auth realm sent to the client if any.
 	BasicRealm          string
-	BasicTicketFlags    int
-	BasicTicketLifetime time.Duration
 	// Negotiate enables/disables the Negotiate WWW auth mechanism which
 	// allows a browser to send a kerberos ticket directly.
 	Negotiate bool
@@ -201,13 +191,12 @@ func (a *Authenticator) doBasicAuth(auth []byte) (user, realm string, err error)
 		return "", "", ErrInvalidUser(string(auth[:i]))
 	}
 
-	lifetime := a.cfg.BasicTicketLifetime
-	if lifetime <= 0 {
-		lifetime = time.Hour
+	cred, err := kerb.NewCredential(user, realm, string(auth[i+1:]), nil)
+	if err != nil {
+		return "", "", err
 	}
 
-	cred := kerb.NewCredential(user, realm, string(auth[i+1:]))
-	tkt, err := cred.GetTicket(a.cred.Principal(), time.Now().Add(lifetime), a.cfg.BasicTicketFlags)
+	tkt, err := cred.GetTicket(a.cred.Principal(), nil)
 	if err != nil {
 		return "", "", err
 	}

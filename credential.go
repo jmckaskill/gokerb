@@ -85,8 +85,8 @@ func ResolveService(service, addr string) (string, error) {
 // created from a credential cache as the cache doesn't store the user
 // password in any form.
 type Credential struct {
-	Dial      func(proto, realm string) (net.Conn, error)
-	key       cipher
+	dial      func(proto, realm string) (net.Conn, error)
+	key       key
 	kvno      int
 	principal principalName
 	realm     string
@@ -98,20 +98,111 @@ type Credential struct {
 	lastReplayPurge time.Time
 }
 
+func chooseAlgorithm(msg *errorMessage) (etype int, salt string, err error) {
+	defer recoverMust(&err)
+
+	var padata []preauth
+	mustUnmarshal(msg.ErrorData, &padata, "")
+
+	for _, algo := range supportedAlgorithms {
+		for _, pa := range padata {
+			if pa.Type != paETypeInfo2 {
+				continue
+			}
+
+			var types []eTypeInfo2
+			mustUnmarshal(pa.Data, &types, "")
+
+			for _, t := range types {
+				if t.EType == algo {
+					return algo, t.Salt, nil
+				}
+			}
+		}
+
+		for _, pa := range padata {
+			if pa.Type != paETypeInfo {
+				continue
+			}
+
+			var types []eTypeInfo
+			mustUnmarshal(pa.Data, &types, "")
+
+			for _, t := range types {
+				if t.EType == algo {
+					return algo, string(t.Salt), nil
+				}
+			}
+		}
+
+		if algo == cryptDesCbcMd5 || algo == cryptDesCbcMd4 {
+			for _, pa := range padata {
+				if pa.Type != paPasswordSalt {
+					continue
+				}
+
+				return algo, string(pa.Data), nil
+			}
+		}
+	}
+
+	return 0, "", ErrNoCommonAlgorithm
+}
+
+type CredConfig struct {
+	Dial  func(proto, realm string) (net.Conn, error)
+}
+
 // NewCredential creates a new client credential that can be used to get
 // tickets. The credential uses the specified UTF8 user, realm, and plaintext
 // password.
 //
-// This does not check if the password is valid. To do that request the
-// krbtgt/<realm> service ticket.
+// Note: This does not check that the password is correct. In order to do that
+// request an appropriate ticket.
 //
 // TODO: Check that UTF8 usernames actually work.
-func NewCredential(user, realm, password string) *Credential {
-	return &Credential{
-		key:       mustLoadKey(rc4HmacAlgorithm, rc4HmacKey(password)),
-		principal: principalName{principalNameType, []string{user}},
-		realm:     strings.ToUpper(realm),
+func NewCredential(user, realm, pass string, cfg *CredConfig) (*Credential, error) {
+	// We need to do an AP_REQ with no preauth in order to get the salt
+	// and to figure out what crypto algorithms are supported for this
+	// principal.
+
+	realm = strings.ToUpper(realm)
+
+	r := request{
+		dial:    cfg.Dial,
+		flags:   defaultLoginFlags,
+		till:    time.Now().Add(defaultLoginDuration),
+		crealm:  realm,
+		srealm:  realm,
+		client:  principalName{principalNameType, strings.Split(user, "/")},
+		service: principalName{serviceInstanceType, []string{"krbtgt", realm}},
 	}
+
+	_, err := r.do()
+	rerr, ok := err.(ErrRemote)
+
+	if err == nil {
+		return nil, ErrProtocol
+	} else if !ok || rerr.ErrorCode() != KDC_ERR_PREAUTH_REQUIRED {
+		return nil, err
+	}
+
+	etype, salt, err := chooseAlgorithm(rerr.msg)
+	if err != nil {
+		return nil, err
+	}
+
+	key, err := loadStringKey(etype, pass, salt)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Credential{
+		dial:      cfg.Dial,
+		key:       key,
+		principal: r.client,
+		realm:     realm,
+	}, nil
 }
 
 // lookupCache looks up a ticket in the tbl cache and returns it if it exists
@@ -151,15 +242,15 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 		return tgt, c.realm, nil
 	}
 
-	// Credentials created with ReadCredentialCache don't know the client password
+	// Credentials created with ReadCredentialCache don't know the client key
 	if c.key == nil {
 		return nil, "", ErrPassword
 	}
 
 	// AS_REQ login
 	r := request{
-		dial:    c.Dial,
 		ckey:    c.key,
+		dial:    c.dial,
 		ckvno:   c.kvno,
 		flags:   defaultLoginFlags,
 		till:    time.Now().Add(defaultLoginDuration),
@@ -169,14 +260,7 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 		service: principalName{serviceInstanceType, []string{"krbtgt", c.realm}},
 	}
 
-	if r.dial == nil {
-		r.dial = DefaultDial
-	}
-
 	tgt, err := r.do()
-	if r.sock != nil {
-		r.sock.Close()
-	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -196,7 +280,10 @@ const (
 	TicketProxy                       = 1 << 27
 	TicketAllowPostdate               = 1 << 26
 	TicketPostdated                   = 1 << 25
+	TicketInvalid                     = 1 << 24
 	TicketRenewable                   = 1 << 23
+	TicketPreauthenticated            = 1 << 22
+	TicketHWAuthenticated             = 1 << 21
 	TicketCanonicalize                = 1 << 16
 	TicketDisableTransitedCheck       = 1 << 5
 	TicketRenewableOk                 = 1 << 4
@@ -206,6 +293,15 @@ const (
 
 	defaultLoginFlags = 0
 )
+
+type TicketConfig struct {
+	Till  time.Time
+	Flags int
+}
+
+var DefaultTicketConfig = TicketConfig{
+	Flags: TicketCanonicalize,
+}
 
 // GetTicket returns a valid ticket for the given service and realm.
 //
@@ -220,7 +316,7 @@ const (
 // Cached entries will not be used if they don't meet all the flags, but the
 // returned ticket may not have all the flags if the domain policy forbids
 // some of them. Valid flag values are of the form Ticket*.
-func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Ticket, error) {
+func (c *Credential) GetTicket(service string, cfg *TicketConfig) (*Ticket, error) {
 	// One of a number of possiblities:
 	// 1. Init state (no keys) user is requesting service key. Send AS_REQ then send TGS_REQ.
 	// 2. Init state (no keys) user is requesting krbtgt key. Send AS_REQ, find krbtgt key in cache.
@@ -233,6 +329,10 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 	// 3. Lookup local realm tgt key in cache. Use with TGS_REQ to get ticket if found and follow trail.
 	// 4. Send AS_REQ to get local realm tgt key. Then send TGS_REQ and follow trail.
 
+	if cfg == nil {
+		cfg = &DefaultTicketConfig
+	}
+
 	// We require that cached entries have at least 10 minutes left to use
 	ctill := time.Now().Add(time.Minute * 10)
 
@@ -244,18 +344,18 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 		c.tgt = make(map[string]*Ticket)
 	}
 
-	if tkt := c.lookupCache(c.cache, service, ctill, flags); tkt != nil {
+	if tkt := c.lookupCache(c.cache, service, ctill, 0); tkt != nil {
 		return tkt, nil
 	}
 
-	tgt, tgtrealm, err := c.getTgt(c.realm, till)
+	tgt, tgtrealm, err := c.getTgt(c.realm, ctill)
 	if err != nil {
 		return nil, err
 	}
 
 	// Lookup in the cache again to handle the corner case where the
 	// requested ticket was the krbtgt login ticket, which getTgt requested.
-	if tkt := c.lookupCache(c.cache, service, ctill, flags); tkt != nil {
+	if tkt := c.lookupCache(c.cache, service, ctill, 0); tkt != nil {
 		return tkt, nil
 	}
 
@@ -263,24 +363,17 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 	// either get our service or we cancel due to a loop in the auth path
 	for i := 0; i < 10; i++ {
 		r := request{
-			dial:    c.Dial,
+			dial:    c.dial,
 			client:  c.principal,
 			crealm:  c.realm,
 			service: splitPrincipal(service),
 			srealm:  tgtrealm,
-			flags:   flags,
-			till:    till,
 			tgt:     tgt,
-		}
-
-		if r.dial == nil {
-			r.dial = DefaultDial
+			flags:   cfg.Flags,
+			till:    cfg.Till,
 		}
 
 		tkt, err := r.do()
-		if r.sock != nil {
-			r.sock.Close()
-		}
 		if err != nil {
 			return nil, err
 		}
@@ -304,7 +397,7 @@ func (c *Credential) GetTicket(service string, till time.Time, flags int) (*Tick
 
 		// We can validly get a different service back if we set the
 		// canon flag
-		if (flags & TicketCanonicalize) != 0 {
+		if (cfg.Flags & TicketCanonicalize) != 0 {
 			c.cache[service] = tkt
 			return tkt, nil
 		}

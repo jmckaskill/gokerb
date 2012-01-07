@@ -18,7 +18,7 @@ func read(file io.Reader, p *int64, buf []byte) []byte {
 	n, err := io.ReadFull(file, buf)
 	*p += int64(n)
 	if err != nil {
-		errpanic(err)
+		panic(err)
 	}
 	return buf
 }
@@ -27,7 +27,7 @@ func skip(file io.Reader, p *int64, n int) {
 	m, err := io.CopyN(ioutil.Discard, file, int64(n))
 	*p += m
 	if err != nil {
-		errpanic(err)
+		panic(err)
 	}
 }
 
@@ -57,7 +57,7 @@ func tryRead32(file io.Reader, p *int64, v *int) bool {
 	if n == 0 && err == io.EOF {
 		return false
 	} else if err != nil {
-		errpanic(err)
+		panic(err)
 	}
 
 	*v = int(binary.BigEndian.Uint32(buf[:]))
@@ -90,7 +90,7 @@ func readPrincipal2(file io.Reader, p *int64, ntype int) (n principalName, realm
 // that need to be able to renew their login.
 //
 // These are produced by MIT, heimdal, and the ktpass utility on windows.
-func ReadKeytab(file io.Reader) (creds []*Credential, err error) {
+func ReadKeytab(file io.Reader, cfg *CredConfig) (creds []*Credential, err error) {
 	defer recoverMust(&err)
 
 	n := int64(0)
@@ -149,6 +149,7 @@ func ReadKeytab(file io.Reader) (creds []*Credential, err error) {
 			kvno:      kvno,
 			realm:     parts[0],
 			principal: principalName{nametype, parts[1:]},
+			dial:      cfg.Dial,
 		})
 	}
 
@@ -346,7 +347,7 @@ func (c *Credential) ReadFrom(file io.Reader) (n int64, err error) {
 // ReadCredentialCache reads a credential cache in from file returning a new
 // credential. Since credential caches do not have the private key, tickets
 // can not be acquired/renewed once the ticket granting ticket expires.
-func ReadCredentialCache(file io.Reader) (rc *Credential, err error) {
+func ReadCredentialCache(file io.Reader, cfg *CredConfig) (rc *Credential, err error) {
 	defer recoverMust(&err)
 	n := int64(0)
 
@@ -360,6 +361,7 @@ func ReadCredentialCache(file io.Reader) (rc *Credential, err error) {
 	c := &Credential{
 		principal: princ,
 		realm:     realm,
+		dial:      cfg.Dial,
 	}
 
 	n += mustReadTickets(c, file)

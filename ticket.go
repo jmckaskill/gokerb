@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/asn1"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -27,13 +26,14 @@ type request struct {
 	dial    func(proto, realm string) (net.Conn, error)
 	client  principalName
 	crealm  string
-	ckey    cipher // only needed for AS requests when tgt == nil
+	ckey    key // only needed for AS requests when tgt == nil
 	ckvno   int
 	service principalName
 	srealm  string
 	till    time.Time
 	flags   int
 	tgt     *Ticket
+	salt    []byte
 
 	// Setup by request.do()
 	nonce  uint32
@@ -41,7 +41,13 @@ type request struct {
 	seqnum uint32
 	sock   net.Conn
 	proto  string
-	subkey cipher
+	subkey key
+}
+
+var notill = asn1.RawValue{
+	Bytes: []byte("19700101000000Z"),
+	Class: 0,
+	Tag:   24,
 }
 
 // sendRequest sends a single ticket request down the sock writer. If r.tgt is
@@ -58,9 +64,13 @@ func (r *request) sendRequest() (err error) {
 		ServiceRealm: r.srealm,
 		Service:      r.service,
 		Flags:        flagsToBitString(r.flags),
-		Till:         r.till.UTC(),
+		Till:         notill,
 		Nonce:        r.nonce,
 		Algorithms:   supportedAlgorithms,
+	}
+
+	if (r.till != time.Time{}) {
+		body.Till.FullBytes = mustMarshal(r.till, "generalized")
 	}
 
 	bodydata := mustMarshal(body, "")
@@ -111,21 +121,23 @@ func (r *request) sendRequest() (err error) {
 		req.Preauth = []preauth{{paTgsRequest, appdata}}
 
 	} else {
-		// For AS requests we add a PA-ENC-TIMESTAMP preauth, even if
-		// its always required rather than trying to handle the
-		// preauth error return.
 		reqparam = asRequestParam
 		req.MsgType = asRequestType
 
-		// Use the sequence number as the microseconds in the
-		// timestamp so that each one is guarenteed to be unique
-		tsdata := mustMarshal(encryptedTimestamp{r.time, int(r.seqnum % 1000000)}, "")
+		// For AS requests we add a PA-ENC-TIMESTAMP preauth if we
+		// have a key spefied. We won't on the first request so that
+		// we can get a preauth error with the salt to use.
+		if r.ckey != nil {
+			// Use the sequence number as the microseconds in the
+			// timestamp so that each one is guarenteed to be unique
+			tsdata := mustMarshal(encryptedTimestamp{r.time, int(r.seqnum % 1000000)}, "")
 
-		algo := r.ckey.EncryptAlgo(paEncryptedTimestampKey)
-		edata := r.ckey.Encrypt(nil, paEncryptedTimestampKey, tsdata)
-		enc := mustMarshal(encryptedData{algo, r.ckvno, edata}, "")
+			algo := r.ckey.EncryptAlgo(paEncryptedTimestampKey)
+			edata := r.ckey.Encrypt(r.salt, paEncryptedTimestampKey, tsdata)
+			enc := mustMarshal(encryptedData{algo, r.ckvno, edata}, "")
 
-		req.Preauth = []preauth{{paEncryptedTimestamp, enc}}
+			req.Preauth = []preauth{{paEncryptedTimestamp, enc}}
+		}
 	}
 
 	data := mustMarshal(req, reqparam)
@@ -137,25 +149,11 @@ func (r *request) sendRequest() (err error) {
 	}
 
 	if r.proto == "udp" && len(data) > maxUDPWrite {
-		errpanic(io.ErrShortWrite)
+		panic(io.ErrShortWrite)
 	}
 
 	mustWrite(r.sock, data)
 	return nil
-}
-
-var _ error = ErrRemote{}
-
-type ErrRemote struct {
-	msg *errorMessage
-}
-
-func (e ErrRemote) ErrorCode() int {
-	return e.msg.ErrorCode
-}
-
-func (e ErrRemote) Error() string {
-	return fmt.Sprintf("kerb: remote error %d %s", e.msg.ErrorCode, e.msg.ErrorText)
 }
 
 func (r *request) recvReply() (tkt *Ticket, err error) {
@@ -181,7 +179,7 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 		data = mustRead(r.sock, data)
 
 	default:
-		errpanic(ErrInvalidProto(r.proto))
+		panic(ErrInvalidProto(r.proto))
 	}
 
 	must(len(data) > 0)
@@ -194,7 +192,7 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 
 	var msgtype, usage int
 	var repparam, encparam string
-	var key cipher
+	var key key
 
 	if r.tgt != nil {
 		repparam = tgsReplyParam
@@ -231,7 +229,10 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 
 	// Decode encrypted part
 	enc := encryptedKdcReply{}
-	edata := mustDecrypt(key, nil, rep.Encrypted.Algo, usage, rep.Encrypted.Data)
+	edata := rep.Encrypted.Data
+	if key != nil {
+		edata = mustDecrypt(key, nil, rep.Encrypted.Algo, usage, rep.Encrypted.Data)
+	}
 	mustUnmarshal(edata, &enc, encparam)
 
 	// The returned service may be different from the request. This
@@ -265,7 +266,7 @@ type Ticket struct {
 	authTime  time.Time
 	startTime time.Time
 	flags     int
-	key       cipher
+	key       key
 }
 
 func DefaultDial(proto, realm string) (net.Conn, error) {
@@ -311,10 +312,12 @@ type timeoutError interface {
 // do performs an AS_REQ (r.ckey != nil) or TGS_REQ (r.tgt != nil) returning a
 // new ticket
 func (r *request) do() (tkt *Ticket, err error) {
+	r.proto = "udp"
+	r.sock = nil
 	r.nonce = 0
 
-	if r.proto == "" {
-		r.proto = "udp"
+	if r.dial == nil {
+		r.dial = DefaultDial
 	}
 
 	// Limit the number of retries before we give up and error out with
@@ -330,12 +333,14 @@ func (r *request) do() (tkt *Ticket, err error) {
 			// Reduce the entropy of the nonce to 31 bits to ensure it fits in a 4
 			// byte asn.1 value. Active directory seems to need this.
 			if err = binary.Read(rand.Reader, binary.BigEndian, &r.nonce); err != nil {
-				return nil, err
+				break
 			}
 			r.nonce >>= 1
 			r.time = time.Now().UTC()
 			r.seqnum = nextSequenceNumber()
-			r.subkey = mustGenerateKey(rand.Reader)
+			if r.tgt != nil {
+				r.subkey = mustGenerateKey(r.tgt.key.EncryptAlgo(tgsReplySubKey), rand.Reader)
+			}
 		}
 
 		// TODO what error do we get if the tcp socket has been closed underneath us
@@ -354,7 +359,7 @@ func (r *request) do() (tkt *Ticket, err error) {
 		tkt, err = r.recvReply()
 
 		if err == nil {
-			return tkt, nil
+			break
 
 		} else if e, ok := err.(ErrRemote); r.proto == "udp" && ok && e.ErrorCode() == KRB_ERR_RESPONSE_TOO_BIG {
 			r.nonce = 0
@@ -375,17 +380,12 @@ func (r *request) do() (tkt *Ticket, err error) {
 		}
 	}
 
-	// Reset the socket if we got some error (even if we could reuse the
-	// socket in some cases) so that next time we start with a clean
-	// slate.
-	r.proto = ""
-
 	if r.sock != nil {
 		r.sock.Close()
 		r.sock = nil
 	}
 
-	return nil, err
+	return tkt, err
 }
 
 // Principal returns the principal of the service the ticket is for

@@ -71,7 +71,7 @@ func mustDecodeGSSWrapper(data []byte) (asn1.ObjectIdentifier, []byte) {
 		// short length form
 
 	default:
-		errpanic(ErrProtocol)
+		panic(ErrProtocol)
 	}
 
 	must(0 <= isz && isz <= len(data))
@@ -81,7 +81,7 @@ func mustDecodeGSSWrapper(data []byte) (asn1.ObjectIdentifier, []byte) {
 	data, err := asn1.Unmarshal(data, &oid)
 
 	if err != nil {
-		errpanic(err)
+		panic(err)
 	}
 
 	return oid, data
@@ -150,7 +150,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 	// 28..(n-1) Deleg: A KRB_CRED message (n = Dlgth + 28) [optional]
 	// n..last Exts: Extensions [optional].
 
-	subkey := mustGenerateKey(rand.Reader)
+	subkey := mustGenerateKey(t.key.EncryptAlgo(appRequestAuthKey), rand.Reader)
 	now := time.Now().UTC()
 	auth := authenticator{
 		ProtoVersion:   kerberosVersion,
@@ -159,7 +159,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 		SequenceNumber: nextSequenceNumber(),
 		Time:           time.Unix(now.Unix(), 0).UTC(), // round to the nearest second
 		Microseconds:   now.Nanosecond() / 1000,
-		Checksum:       checksumData{gssFakeChecksum, gsschk[:]},
+		Checksum:       checksumData{signGssFake, gsschk[:]},
 		SubKey: encryptionKey{
 			Algo: subkey.EncryptAlgo(appRequestAuthKey),
 			Key:  subkey.Key(),
@@ -204,7 +204,7 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 	case gssAppReply:
 		// continue below
 	default:
-		errpanic(ErrProtocol)
+		panic(ErrProtocol)
 	}
 
 	rep := appReply{}
@@ -272,7 +272,7 @@ type gssWrapper struct {
 	rxseqnum, txseqnum uint32
 	checkseq           bool
 	maxtxsize          int
-	key                cipher
+	key                key
 	client, conf       bool
 	rw                 io.ReadWriter
 }
@@ -349,7 +349,7 @@ func chooseGSSSecurity(avail, flags int) int {
 }
 
 // See RFC1964 1.2.2
-func mustGSSUnwrap(gdata []byte, key cipher, dir uint32, conf bool) (seqnum uint32, data []byte) {
+func mustGSSUnwrap(gdata []byte, key key, dir uint32, conf bool) (seqnum uint32, data []byte) {
 	must(len(gdata) >= 2)
 
 	oid, idata := mustDecodeGSSWrapper(gdata)
@@ -364,7 +364,7 @@ func mustGSSUnwrap(gdata []byte, key cipher, dir uint32, conf bool) (seqnum uint
 	data = idata[24:]
 
 	must(tok == gssWrap)
-	must((sealalg != gssSealNone) == conf)
+	must((sealalg != cryptGssNone) == conf)
 
 	// checksum salt
 	seqdata = mustDecrypt(key, chk, sealalg, gssSequenceNumber, seqdata)
@@ -388,12 +388,12 @@ func mustGSSUnwrap(gdata []byte, key cipher, dir uint32, conf bool) (seqnum uint
 }
 
 // See RFC1964 1.2.2
-func mustGSSWrap(seqnum uint32, data []byte, key cipher, dir uint32, conf bool) []byte {
+func mustGSSWrap(seqnum uint32, data []byte, key key, dir uint32, conf bool) []byte {
 	signalgo := key.SignAlgo(gssWrapSign)
 	sealalgo := key.EncryptAlgo(gssWrapSeal)
 
 	if !conf {
-		sealalgo = gssSealNone
+		sealalgo = cryptGssNone
 	}
 
 	d := make([]byte, 32)
@@ -415,7 +415,7 @@ func mustGSSWrap(seqnum uint32, data []byte, key cipher, dir uint32, conf bool) 
 
 	// RFC4757 (MS RC4-HMAC) violates the standard padding and wants
 	// explicitely only one byte
-	if key.EncryptAlgo(gssSequenceNumber) == gssSealRC4 {
+	if key.EncryptAlgo(gssSequenceNumber) == cryptGssRc4Hmac {
 		padsz = 1
 	}
 
@@ -518,11 +518,11 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	must(tkt.ProtoVersion == kerberosVersion)
 
 	if tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
-		errpanic(ErrTicket{"wrong service"})
+		panic(ErrTicket{"wrong service"})
 	}
 
 	if c.kvno != 0 && c.kvno != tkt.Encrypted.KeyVersion {
-		errpanic(ErrTicket{"wrong key version"})
+		panic(ErrTicket{"wrong key version"})
 	}
 
 	etkt := encryptedTicket{}
@@ -531,10 +531,13 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 
 	now := time.Now().UTC()
 	if etkt.From != *new(time.Time) && now.Before(etkt.From) {
-		errpanic(ErrTicket{"not valid yet"})
+		panic(ErrTicket{"not valid yet"})
 	}
 	if now.After(etkt.Till) {
-		errpanic(ErrTicket{"expired"})
+		panic(ErrTicket{"expired"})
+	}
+	if bitStringToFlags(etkt.Flags) & TicketInvalid != 0 {
+		panic(ErrTicket{"invalid flag"})
 	}
 
 	tkey := mustLoadKey(etkt.Key.Algo, etkt.Key.Key)
@@ -553,7 +556,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 
 	// Check the fake checksum.
 	// TODO: handle forwarded credentials
-	must(auth.Checksum.Algo == gssFakeChecksum && len(auth.Checksum.Data) >= 4)
+	must(auth.Checksum.Algo == signGssFake && len(auth.Checksum.Data) >= 4)
 
 	bndlen := int(binary.LittleEndian.Uint32(auth.Checksum.Data))
 	must(0 <= bndlen && bndlen+8 <= len(auth.Checksum.Data))
@@ -637,7 +640,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	}
 
 	if availsec == 0 {
-		errpanic(ErrNoAvailableSecurity)
+		panic(ErrNoCommonAlgorithm)
 	}
 
 	g := &gssWrapper{
@@ -674,7 +677,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	case saslConfidential:
 		g.conf = true
 	default:
-		errpanic(ErrProtocol)
+		panic(ErrProtocol)
 	}
 
 	return g, user, realm, nil

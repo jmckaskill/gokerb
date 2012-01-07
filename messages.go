@@ -4,6 +4,7 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -118,14 +119,44 @@ const (
 const (
 	paTgsRequest = 1 + iota
 	paEncryptedTimestamp
+	paPasswordSalt
+	_
+	_
+	_
+	_
+	_
+	_
+	_
+	paETypeInfo
+	_
+	_
+	_
+	_
+	_
+	_
+	_
+	paETypeInfo2
 )
 
 // Encryption algorithms
 const (
-	rc4HmacAlgorithm = 23
-	rc4HmacChecksum  = -138
-	md5Checksum      = 7
-	gssFakeChecksum  = 0x8003
+	cryptDesCbcMd4 = 2
+	cryptDesCbcMd5 = 3
+	cryptRc4Hmac   = 23
+	signMd4        = 2
+	signMd4Des     = 3
+	signMd5        = 7
+	signMd5Des     = 8
+	signRc4Hmac    = -138
+	signGssFake    = 0x8003
+
+	cryptGssDes     = 0x0000
+	cryptGssRc4Hmac = 0x1000
+	cryptGssNone    = 0xFFFF
+
+	signGssMd5Des  = 0x0000
+	signGssDes     = 0x0200
+	signGssRc4Hmac = 0x1100
 )
 
 // Key usage values
@@ -163,19 +194,19 @@ const (
 	applicationClass     = 0x40
 	udpReadTimeout       = 3e9
 	defaultLoginDuration = time.Hour * 24
-	maxUDPWrite          = 1400 // TODO: figure out better way of doing this
+	maxUDPWrite          = 1400      // TODO: figure out better way of doing this
 	maxGSSWrapRead       = 64 * 1024 // TODO: remove this as a limitation
 	maxPDUSize           = 4 * 1024
 )
 
 var (
-	ErrParse               = errors.New("kerb: parse error")
-	ErrProtocol            = errors.New("kerb: protocol error")
-	ErrAuthLoop            = errors.New("kerb: auth loop")
-	ErrPassword            = errors.New("kerb: can't renew the main krbtgt ticket as the password is unknown")
-	ErrNoAvailableSecurity = errors.New("kerb: no available SASL security mode")
+	ErrParse             = errors.New("kerb: parse error")
+	ErrProtocol          = errors.New("kerb: protocol error")
+	ErrAuthLoop          = errors.New("kerb: auth loop")
+	ErrPassword          = errors.New("kerb: can't renew the main krbtgt ticket as the password is unknown")
+	ErrNoCommonAlgorithm = errors.New("kerb: no common algorithm")
 
-	supportedAlgorithms = []int{rc4HmacAlgorithm}
+	supportedAlgorithms = []int{cryptRc4Hmac, cryptDesCbcMd5, cryptDesCbcMd4}
 
 	asRequestParam     = "application,explicit,tag:10"
 	tgsRequestParam    = "application,explicit,tag:12"
@@ -199,6 +230,18 @@ var (
 	gssMsKrb5Oid  = asn1.ObjectIdentifier([]int{1, 2, 840, 48018, 1, 2, 2})
 	gssSpnegoOid  = asn1.ObjectIdentifier([]int{1, 3, 6, 1, 5, 5, 2})
 )
+
+type ErrRemote struct {
+	msg *errorMessage
+}
+
+func (e ErrRemote) ErrorCode() int {
+	return e.msg.ErrorCode
+}
+
+func (e ErrRemote) Error() string {
+	return fmt.Sprintf("kerb: remote error %d %s", e.msg.ErrorCode, e.msg.ErrorText)
+}
 
 type ErrInvalidProto string
 
@@ -272,18 +315,6 @@ const (
 	saslConfidential
 )
 
-// gss wrap encryption and checksum types
-const (
-	gssSealDES  = 0x0000
-	gssSealRC4  = 0x1000
-	gssSealNone = 0xFFFF
-
-	gssSignDES_MAC_MD5 = 0x0000
-	gssSignMD2_5       = 0x0100
-	gssSignDES_MAC     = 0x0200
-	gssSignHMAC_MD5    = 0x1100
-)
-
 type principalName struct {
 	Type  int      `asn1:"explicit,tag:0"`
 	Parts []string `asn1:"general,explicit,tag:1"`
@@ -338,6 +369,16 @@ type encryptedTimestamp struct {
 	Microseconds int       `asn1:"optional,explicit,tag:1"`
 }
 
+type eTypeInfo struct {
+	EType int    `asn1:"explicit,tag:0"`
+	Salt  []byte `asn1:"explicit,tag:1,optional"`
+}
+
+type eTypeInfo2 struct {
+	EType int    `asn1:"explicit,tag:0"`
+	Salt  string `asn1:"explicit,tag:1,optional"`
+}
+
 type encryptedTicket struct {
 	Flags        asn1.BitString    `asn1:"explicit,tag:0"`
 	Key          encryptionKey     `asn1:"explicit,tag:1"`
@@ -365,7 +406,7 @@ type kdcRequestBody struct {
 	ServiceRealm      string          `asn1:"general,explicit,tag:2"`
 	Service           principalName   `asn1:"optional,explicit,tag:3"`
 	From              time.Time       `asn1:"generalized,optional,explicit,tag:4"`
-	Till              time.Time       `asn1:"generalized,explicit,tag:5"`
+	Till              asn1.RawValue   `asn1:"explicit,tag:5"`
 	RenewTill         time.Time       `asn1:"generalized,optional,explicit,tag:6"`
 	Nonce             uint32          `asn1:"explicit,tag:7"`
 	Algorithms        []int           `asn1:"explicit,tag:8"`
@@ -514,50 +555,42 @@ func flagsToBitString(flags int) (s asn1.BitString) {
 
 func must(cond bool) {
 	if !cond {
-		errpanic(ErrProtocol)
+		panic(ErrProtocol)
 	}
 }
 
 func mustMarshal(val interface{}, params string) []byte {
 	data, err := asn1.MarshalWithParams(val, params)
 	if err != nil {
-		errpanic(err)
+		panic(err)
 	}
 	return data
 }
 
 func mustUnmarshal(data []byte, val interface{}, params string) {
-	left, err := asn1.UnmarshalWithParams(data, val, params)
-	if err != nil {
-		errpanic(err)
-	}
-	if len(left) > 0 {
-		errpanic(ErrProtocol)
+	if _, err := asn1.UnmarshalWithParams(data, val, params); err != nil {
+		panic(err)
 	}
 }
 
 func mustRead(r io.Reader, buf []byte) []byte {
 	n, err := r.Read(buf)
 	if err != nil {
-		errpanic(err)
+		panic(err)
 	}
 	return buf[:n]
 }
 
 func mustReadFull(r io.Reader, buf []byte) {
 	if _, err := io.ReadFull(r, buf); err != nil {
-		errpanic(err)
+		panic(err)
 	}
 }
 
 func mustWrite(w io.Writer, buf []byte) {
 	if _, err := w.Write(buf); err != nil {
-		errpanic(err)
+		panic(err)
 	}
-}
-
-func errpanic(err error) {
-	panic(err)
 }
 
 func recoverMust(perr *error) {
@@ -573,4 +606,3 @@ func recoverMust(perr *error) {
 
 	*perr = err
 }
-
