@@ -1,29 +1,17 @@
 package kerb
 
 import (
-	"crypto/rand"
 	"encoding/asn1"
 	"encoding/binary"
 	"io"
 	"net"
 	"strconv"
-	"sync/atomic"
+	"strings"
 	"time"
 )
 
-func initSequenceNumber() (ret uint32) {
-	buf := mustRead(rand.Reader, make([]byte, 4))
-	return binary.BigEndian.Uint32(buf)
-}
-
-var usSequenceNumber uint32 = initSequenceNumber()
-
-func nextSequenceNumber() uint32 {
-	return atomic.AddUint32(&usSequenceNumber, 1)
-}
-
 type request struct {
-	dial    func(proto, realm string) (net.Conn, error)
+	cfg     *CredConfig
 	client  principalName
 	crealm  string
 	ckey    key // only needed for AS requests when tgt == nil
@@ -39,9 +27,8 @@ type request struct {
 	nonce  uint32
 	time   time.Time
 	seqnum uint32
-	sock   net.Conn
+	sock   io.ReadWriteCloser
 	proto  string
-	subkey key
 }
 
 var notill = asn1.RawValue{
@@ -57,7 +44,7 @@ var notill = asn1.RawValue{
 // connections such that if the remote receives multiple retries it discards
 // the latters as replays.
 func (r *request) sendRequest() (err error) {
-	defer recoverMust(&err)
+	//defer recoverMust(&err)
 
 	body := kdcRequestBody{
 		Client:       r.client,
@@ -99,10 +86,6 @@ func (r *request) sendRequest() (err error) {
 			SequenceNumber: r.seqnum,
 			Time:           time.Unix(r.time.Unix(), 0).UTC(), // round to the nearest second
 			Checksum:       checksumData{calgo, chk},
-			SubKey: encryptionKey{
-				Algo: r.subkey.EncryptAlgo(tgsReplySubKey),
-				Key:  r.subkey.Key(),
-			},
 		}
 
 		authdata := mustMarshal(auth, authenticatorParam)
@@ -111,7 +94,7 @@ func (r *request) sendRequest() (err error) {
 			MsgType:      appRequestType,
 			Flags:        flagsToBitString(0),
 			Ticket:       asn1.RawValue{FullBytes: r.tgt.ticket},
-			Authenticator: encryptedData{
+			Auth: encryptedData{
 				Algo: r.tgt.key.EncryptAlgo(paTgsRequestKey),
 				Data: r.tgt.key.Encrypt(nil, paTgsRequestKey, authdata),
 			},
@@ -157,7 +140,7 @@ func (r *request) sendRequest() (err error) {
 }
 
 func (r *request) recvReply() (tkt *Ticket, err error) {
-	defer recoverMust(&err)
+	//defer recoverMust(&err)
 
 	var data []byte
 
@@ -197,8 +180,8 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 	if r.tgt != nil {
 		repparam = tgsReplyParam
 		msgtype = tgsReplyType
-		key = r.subkey
-		usage = tgsReplySubKey
+		key = r.tgt.key
+		usage = tgsReplySessionKey
 		encparam = encTgsReplyParam
 	} else {
 		repparam = asReplyParam
@@ -241,6 +224,7 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 	key = mustLoadKey(enc.Key.Algo, enc.Key.Key)
 
 	return &Ticket{
+		cfg:       r.cfg,
 		client:    r.client,
 		crealm:    r.crealm,
 		service:   enc.Service,
@@ -256,6 +240,7 @@ func (r *request) recvReply() (tkt *Ticket, err error) {
 }
 
 type Ticket struct {
+	cfg       *CredConfig
 	client    principalName
 	crealm    string
 	service   principalName
@@ -269,7 +254,7 @@ type Ticket struct {
 	key       key
 }
 
-func DefaultDial(proto, realm string) (net.Conn, error) {
+func DefaultDial(proto, realm string) (io.ReadWriteCloser, error) {
 	if proto != "tcp" && proto != "udp" {
 		return nil, ErrInvalidProto(proto)
 	}
@@ -316,31 +301,26 @@ func (r *request) do() (tkt *Ticket, err error) {
 	r.sock = nil
 	r.nonce = 0
 
-	if r.dial == nil {
-		r.dial = DefaultDial
-	}
-
 	// Limit the number of retries before we give up and error out with
 	// the last error
 	for i := 0; i < 3; i++ {
 		if r.sock == nil {
-			if r.sock, err = r.dial(r.proto, r.srealm); err != nil {
+			if r.sock, err = r.cfg.dial(r.proto, r.srealm); err != nil {
 				break
 			}
 		}
 
 		if r.nonce == 0 {
-			// Reduce the entropy of the nonce to 31 bits to ensure it fits in a 4
-			// byte asn.1 value. Active directory seems to need this.
-			if err = binary.Read(rand.Reader, binary.BigEndian, &r.nonce); err != nil {
+			if err = binary.Read(r.cfg.rand(), binary.BigEndian, &r.nonce); err != nil {
 				break
 			}
-			r.nonce >>= 1
-			r.time = time.Now().UTC()
-			r.seqnum = nextSequenceNumber()
-			if r.tgt != nil {
-				r.subkey = mustGenerateKey(r.tgt.key.EncryptAlgo(tgsReplySubKey), rand.Reader)
+			if err = binary.Read(r.cfg.rand(), binary.BigEndian, &r.seqnum); err != nil {
+				break
 			}
+			// Reduce the entropy of the nonce to 31 bits to ensure it fits in a 4
+			// byte asn.1 value. Active directory seems to need this.
+			r.nonce >>= 1
+			r.time = r.cfg.now().UTC()
 		}
 
 		// TODO what error do we get if the tcp socket has been closed underneath us
@@ -401,4 +381,85 @@ func (t *Ticket) Realm() string {
 // ExpiryTime returns the time at which the ticket expires
 func (t *Ticket) ExpiryTime() time.Time {
 	return t.till
+}
+
+// GenerateTicket generates a local ticket that a client can use to
+// authenticate against this credential.
+//
+// This is provided for loopback clients and unit tests, and SHOULD NOT be
+// used outside of those cases. For all other cases, tickets should be
+// requested through the KDC.
+func (c *Credential) GenerateTicket(client, crealm string, cfg *TicketConfig) (rtkt *Ticket, rerr error) {
+	defer recoverMust(&rerr)
+
+	crealm = strings.ToUpper(crealm)
+
+	if cfg == nil {
+		cfg = &DefaultTicketConfig
+	}
+
+	if c.key == nil {
+		return nil, ErrPassword
+	}
+
+	etype := c.key.EncryptAlgo(ticketKey)
+	tkey := mustGenerateKey(etype, c.cfg.rand())
+	till := cfg.Till
+	now := c.cfg.now().UTC()
+
+	// round down to the nearest millisecond as the wire protocol doesn't allow higher res
+	now = now.Add(-(time.Duration(now.Nanosecond()) % time.Millisecond))
+
+	if till.IsZero() {
+		// a long way in the future
+		till = now.Add(200 * 356 * 24 * time.Hour)
+	}
+
+	etkt := encryptedTicket{
+		Flags: flagsToBitString(cfg.Flags),
+		Key: encryptionKey{
+			Algo: etype,
+			Key:  tkey.Key(),
+		},
+		ClientRealm: crealm,
+		Client:      splitPrincipal(client),
+		AuthTime:    now,
+		Till:        till,
+	}
+
+	etktdata := mustMarshal(etkt, encTicketParam)
+
+	tkt := ticket{
+		ProtoVersion: kerberosVersion,
+		Realm:        c.realm,
+		Service:      c.principal,
+		Encrypted: encryptedData{
+			Algo: c.key.EncryptAlgo(ticketKey),
+			Data: c.key.Encrypt(nil, ticketKey, etktdata),
+		},
+	}
+
+	tktdata := mustMarshal(tkt, ticketParam)
+
+	return &Ticket{
+		cfg:       c.cfg,
+		client:    etkt.Client,
+		crealm:    crealm,
+		service:   c.principal,
+		srealm:    c.realm,
+		ticket:    tktdata,
+		till:      till,
+		authTime:  now,
+		startTime: now,
+		flags:     cfg.Flags,
+		key:       tkey,
+	}, nil
+}
+
+func (c *Credential) mustGenerateTicket(client, crealm string, cfg *TicketConfig) *Ticket {
+	tkt, err := c.GenerateTicket(client, crealm, cfg)
+	if err != nil {
+		panic(err)
+	}
+	return tkt
 }

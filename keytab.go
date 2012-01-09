@@ -144,13 +144,9 @@ func ReadKeytab(file io.Reader, cfg *CredConfig) (creds []*Credential, err error
 		}
 
 		key := mustLoadKey(keytype, keydata)
-		creds = append(creds, &Credential{
-			key:       key,
-			kvno:      kvno,
-			realm:     parts[0],
-			principal: principalName{nametype, parts[1:]},
-			dial:      cfg.Dial,
-		})
+		pr := principalName{nametype, parts[1:]}
+		c := newCredential(pr, parts[0], key, kvno, cfg)
+		creds = append(creds, c)
 	}
 
 	return creds, nil
@@ -181,7 +177,7 @@ func appendPrincipal(d []byte, princ principalName, realm string) []byte {
 // WriteTo writes the credential and cached tickets out to a file as a
 // credential cache. This can then be read in by MIT or heimdal kerberos.
 func (c *Credential) WriteTo(file io.Writer) (int64, error) {
-	now := time.Now()
+	now := c.cfg.now()
 	n := int64(0)
 	d := make([]byte, 0)
 
@@ -246,7 +242,7 @@ func (s ErrWrongPrincipal) Error() string {
 }
 
 func mustReadTickets(c *Credential, file io.Reader) (n int64) {
-	now := time.Now()
+	now := c.cfg.now()
 	ctype := 0
 
 	for tryRead32(file, &n, &ctype) {
@@ -358,12 +354,7 @@ func ReadCredentialCache(file io.Reader, cfg *CredConfig) (rc *Credential, err e
 
 	princ, realm := readPrincipal(file, &n)
 
-	c := &Credential{
-		principal: princ,
-		realm:     realm,
-		dial:      cfg.Dial,
-	}
-
+	c := newCredential(princ, realm, nil, 0, cfg)
 	n += mustReadTickets(c, file)
 	return c, nil
 }

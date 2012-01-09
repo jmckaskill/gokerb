@@ -151,12 +151,11 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 	// n..last Exts: Extensions [optional].
 
 	subkey := mustGenerateKey(t.key.EncryptAlgo(appRequestAuthKey), rand.Reader)
-	now := time.Now().UTC()
+	now := t.cfg.now().UTC()
 	auth := authenticator{
 		ProtoVersion:   kerberosVersion,
 		ClientRealm:    t.crealm,
 		Client:         t.client,
-		SequenceNumber: nextSequenceNumber(),
 		Time:           time.Unix(now.Unix(), 0).UTC(), // round to the nearest second
 		Microseconds:   now.Nanosecond() / 1000,
 		Checksum:       checksumData{signGssFake, gsschk[:]},
@@ -166,13 +165,17 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 		},
 	}
 
+	if err := binary.Read(t.cfg.rand(), binary.BigEndian, &auth.SequenceNumber); err != nil {
+		return nil, err
+	}
+
 	authdata := mustMarshal(auth, authenticatorParam)
 	req := appRequest{
 		ProtoVersion: kerberosVersion,
 		MsgType:      appRequestType,
 		Flags:        flagsToBitString(appflags),
 		Ticket:       asn1.RawValue{FullBytes: t.ticket},
-		Authenticator: encryptedData{
+		Auth: encryptedData{
 			Algo: t.key.EncryptAlgo(appRequestAuthKey),
 			Data: t.key.Encrypt(nil, appRequestAuthKey, authdata),
 		},
@@ -438,7 +441,7 @@ func mustGSSWrap(seqnum uint32, data []byte, key key, dir uint32, conf bool) []b
 }
 
 func (c *Credential) isReplay(auth *authenticator, etkt *encryptedTicket) bool {
-	now := time.Now().UTC()
+	now := c.cfg.now().UTC()
 
 	c.lk.Lock()
 	defer c.lk.Unlock()
@@ -529,14 +532,14 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	etktdata := mustDecrypt(c.key, nil, tkt.Encrypted.Algo, ticketKey, tkt.Encrypted.Data)
 	mustUnmarshal(etktdata, &etkt, encTicketParam)
 
-	now := time.Now().UTC()
+	now := c.cfg.now().UTC()
 	if etkt.From != *new(time.Time) && now.Before(etkt.From) {
 		panic(ErrTicket{"not valid yet"})
 	}
 	if now.After(etkt.Till) {
 		panic(ErrTicket{"expired"})
 	}
-	if bitStringToFlags(etkt.Flags) & TicketInvalid != 0 {
+	if bitStringToFlags(etkt.Flags)&TicketInvalid != 0 {
 		panic(ErrTicket{"invalid flag"})
 	}
 
@@ -547,7 +550,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	// Check the authenticator
 
 	auth := authenticator{}
-	authdata := mustDecrypt(tkey, nil, req.Authenticator.Algo, appRequestAuthKey, req.Authenticator.Data)
+	authdata := mustDecrypt(tkey, nil, req.Auth.Algo, appRequestAuthKey, req.Auth.Data)
 	mustUnmarshal(authdata, &auth, authenticatorParam)
 
 	must(auth.ProtoVersion == kerberosVersion)
@@ -576,7 +579,10 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	erep := encryptedAppReply{
 		ClientTime:         auth.Time,
 		ClientMicroseconds: auth.Microseconds,
-		SequenceNumber:     nextSequenceNumber(),
+	}
+
+	if err := binary.Read(c.cfg.rand(), binary.BigEndian, &erep.SequenceNumber); err != nil {
+		return nil, "", "", err
 	}
 
 	erepdata := mustMarshal(erep, encAppReplyParam)

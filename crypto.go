@@ -575,3 +575,11 @@ func mustLoadKey(algo int, key []byte) key {
 	}
 	return k
 }
+
+func mustLoadStringKey(algo int, pass, salt string) key {
+	k, err := loadStringKey(algo, pass, salt)
+	if err != nil {
+		panic(err)
+	}
+	return k
+}

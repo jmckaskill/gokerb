@@ -193,7 +193,6 @@ const (
 	kerberosVersion      = 5
 	applicationClass     = 0x40
 	udpReadTimeout       = 3e9
-	defaultLoginDuration = time.Hour * 24
 	maxUDPWrite          = 1400      // TODO: figure out better way of doing this
 	maxGSSWrapRead       = 64 * 1024 // TODO: remove this as a limitation
 	maxPDUSize           = 4 * 1024
@@ -446,11 +445,11 @@ type encryptedKdcReply struct {
 }
 
 type appRequest struct {
-	ProtoVersion  int            `asn1:"explicit,tag:0"`
-	MsgType       int            `asn1:"explicit,tag:1"`
-	Flags         asn1.BitString `asn1:"explicit,tag:2"`
-	Ticket        asn1.RawValue  `asn1:"explicit,tag:3"`
-	Authenticator encryptedData  `asn1:"explicit,tag:4"`
+	ProtoVersion int            `asn1:"explicit,tag:0"`
+	MsgType      int            `asn1:"explicit,tag:1"`
+	Flags        asn1.BitString `asn1:"explicit,tag:2"`
+	Ticket       asn1.RawValue  `asn1:"explicit,tag:3"`
+	Auth         encryptedData  `asn1:"explicit,tag:4"`
 }
 
 type authenticator struct {

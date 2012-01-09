@@ -37,7 +37,9 @@ Ticket:
 package kerb
 
 import (
+	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -72,30 +74,6 @@ func ResolveService(service, addr string) (string, error) {
 	}
 
 	return fmt.Sprintf("%s/%s", service, name), nil
-}
-
-// Credential is a wrapper for a locally owned user or service principal. It
-// can be used to authenticate to other services or to check incoming requests
-// against. A credential can be created from a user, realm, password triple, a
-// credential cache created by MIT or heimdal kerberos, or a keytab created
-// for a service principal.
-//
-// It will store the password in hashed form if created from a keytab or
-// plaintext password so that we can renew tickets.  This is not possible if
-// created from a credential cache as the cache doesn't store the user
-// password in any form.
-type Credential struct {
-	dial      func(proto, realm string) (net.Conn, error)
-	key       key
-	kvno      int
-	principal principalName
-	realm     string
-
-	lk              sync.Mutex
-	cache           map[string]*Ticket
-	tgt             map[string]*Ticket
-	replay          map[replayKey]bool
-	lastReplayPurge time.Time
 }
 
 func chooseAlgorithm(msg *errorMessage) (etype int, salt string, err error) {
@@ -134,23 +112,81 @@ func chooseAlgorithm(msg *errorMessage) (etype int, salt string, err error) {
 				}
 			}
 		}
+	}
 
-		if algo == cryptDesCbcMd5 || algo == cryptDesCbcMd4 {
-			for _, pa := range padata {
-				if pa.Type != paPasswordSalt {
-					continue
-				}
-
-				return algo, string(pa.Data), nil
-			}
+	for _, pa := range padata {
+		if pa.Type != paPasswordSalt {
+			continue
 		}
+
+		return cryptDesCbcMd5, string(pa.Data), nil
 	}
 
 	return 0, "", ErrNoCommonAlgorithm
 }
 
+type DialFn func(proto, realm string) (io.ReadWriteCloser, error)
+type NowFn func() time.Time
+
 type CredConfig struct {
-	Dial  func(proto, realm string) (net.Conn, error)
+	Dial DialFn
+	Now  NowFn
+	Rand io.Reader
+}
+
+func (c *CredConfig) dial(proto, realm string) (io.ReadWriteCloser, error) {
+	if c.Dial != nil {
+		return c.Dial(proto, realm)
+	}
+	return DefaultDial(proto, realm)
+}
+
+func (c *CredConfig) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
+}
+
+func (c *CredConfig) rand() io.Reader {
+	if c.Rand != nil {
+		return c.Rand
+	}
+	return rand.Reader
+}
+
+// Credential is a wrapper for a locally owned user or service principal. It
+// can be used to authenticate to other services or to check incoming requests
+// against. A credential can be created from a user, realm, password triple, a
+// credential cache created by MIT or heimdal kerberos, or a keytab created
+// for a service principal.
+//
+// It will store the password in hashed form if created from a keytab or
+// plaintext password so that we can renew tickets.  This is not possible if
+// created from a credential cache as the cache doesn't store the user
+// password in any form.
+type Credential struct {
+	cfg       *CredConfig
+	key       key
+	kvno      int
+	principal principalName
+	realm     string
+
+	lk              sync.Mutex
+	cache           map[string]*Ticket
+	tgt             map[string]*Ticket
+	replay          map[replayKey]bool
+	lastReplayPurge time.Time
+}
+
+func newCredential(pr principalName, realm string, key key, kvno int, cfg *CredConfig) *Credential {
+	return &Credential{
+		cfg:       cfg,
+		principal: pr,
+		realm:     realm,
+		key:       key,
+		kvno:      kvno,
+	}
 }
 
 // NewCredential creates a new client credential that can be used to get
@@ -167,15 +203,16 @@ func NewCredential(user, realm, pass string, cfg *CredConfig) (*Credential, erro
 	// principal.
 
 	realm = strings.ToUpper(realm)
+	client := principalName{principalNameType, strings.Split(user, "/")}
+	c := newCredential(client, realm, nil, 0, cfg)
 
 	r := request{
-		dial:    cfg.Dial,
+		cfg:     c.cfg,
 		flags:   defaultLoginFlags,
-		till:    time.Now().Add(defaultLoginDuration),
+		client:  client,
 		crealm:  realm,
+		service: principalName{principalNameType, []string{"krbtgt", realm}},
 		srealm:  realm,
-		client:  principalName{principalNameType, strings.Split(user, "/")},
-		service: principalName{serviceInstanceType, []string{"krbtgt", realm}},
 	}
 
 	_, err := r.do()
@@ -192,17 +229,12 @@ func NewCredential(user, realm, pass string, cfg *CredConfig) (*Credential, erro
 		return nil, err
 	}
 
-	key, err := loadStringKey(etype, pass, salt)
+	c.key, err = loadStringKey(etype, pass, salt)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Credential{
-		dial:      cfg.Dial,
-		key:       key,
-		principal: r.client,
-		realm:     realm,
-	}, nil
+	return c, nil
 }
 
 // lookupCache looks up a ticket in the tbl cache and returns it if it exists
@@ -249,15 +281,14 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 
 	// AS_REQ login
 	r := request{
+		cfg:     c.cfg,
 		ckey:    c.key,
-		dial:    c.dial,
 		ckvno:   c.kvno,
 		flags:   defaultLoginFlags,
-		till:    time.Now().Add(defaultLoginDuration),
 		crealm:  c.realm,
 		srealm:  c.realm,
 		client:  c.principal,
-		service: principalName{serviceInstanceType, []string{"krbtgt", c.realm}},
+		service: principalName{principalNameType, []string{"krbtgt", c.realm}},
 	}
 
 	tgt, err := r.do()
@@ -329,12 +360,12 @@ func (c *Credential) GetTicket(service string, cfg *TicketConfig) (*Ticket, erro
 	// 3. Lookup local realm tgt key in cache. Use with TGS_REQ to get ticket if found and follow trail.
 	// 4. Send AS_REQ to get local realm tgt key. Then send TGS_REQ and follow trail.
 
+	// We require that cached entries have at least 10 minutes left to use
+	ctill := c.cfg.now().Add(time.Minute * 10)
+
 	if cfg == nil {
 		cfg = &DefaultTicketConfig
 	}
-
-	// We require that cached entries have at least 10 minutes left to use
-	ctill := time.Now().Add(time.Minute * 10)
 
 	c.lk.Lock()
 	defer c.lk.Unlock()
@@ -363,7 +394,7 @@ func (c *Credential) GetTicket(service string, cfg *TicketConfig) (*Ticket, erro
 	// either get our service or we cancel due to a loop in the auth path
 	for i := 0; i < 10; i++ {
 		r := request{
-			dial:    c.dial,
+			cfg:     c.cfg,
 			client:  c.principal,
 			crealm:  c.realm,
 			service: splitPrincipal(service),
