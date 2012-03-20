@@ -2,10 +2,10 @@ package kerb
 
 import (
 	"bytes"
+	"code.google.com/p/go.crypto/md4"
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/hmac"
-	"crypto/md4"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rc4"
@@ -129,7 +129,7 @@ func (c *rc4hmac) Sign(algo, usage int, data ...[]byte) ([]byte, error) {
 		return unkeyedSign(algo, usage, data...)
 	}
 
-	h := hmac.NewMD5(c.key)
+	h := hmac.New(md5.New, c.key)
 	h.Write(signaturekey)
 	ksign := h.Sum(nil)
 
@@ -139,7 +139,7 @@ func (c *rc4hmac) Sign(algo, usage int, data ...[]byte) ([]byte, error) {
 		chk.Write(d)
 	}
 
-	h = hmac.NewMD5(ksign)
+	h = hmac.New(md5.New, ksign)
 	h.Write(chk.Sum(nil))
 	return h.Sum(nil), nil
 }
@@ -148,9 +148,9 @@ func (c *rc4hmac) Encrypt(salt []byte, usage int, data ...[]byte) []byte {
 	switch usage {
 	case gssSequenceNumber:
 		// salt is the checksum
-		h := hmac.NewMD5(c.key)
+		h := hmac.New(md5.New, c.key)
 		binary.Write(h, binary.LittleEndian, uint32(0))
-		h = hmac.NewMD5(h.Sum(nil))
+		h = hmac.New(md5.New, h.Sum(nil))
 		h.Write(salt)
 		r, _ := rc4.NewCipher(h.Sum(nil))
 		for _, d := range data {
@@ -165,7 +165,7 @@ func (c *rc4hmac) Encrypt(salt []byte, usage int, data ...[]byte) []byte {
 		for i, b := range c.key {
 			kcrypt[i] = b ^ 0xF0
 		}
-		h := hmac.NewMD5(kcrypt)
+		h := hmac.New(md5.New, kcrypt)
 		binary.Write(h, binary.LittleEndian, seqnum)
 		r, _ := rc4.NewCipher(h.Sum(nil))
 		for _, d := range data {
@@ -183,12 +183,12 @@ func (c *rc4hmac) Encrypt(salt []byte, usage int, data ...[]byte) []byte {
 	io.ReadFull(rand.Reader, out[16:24])
 
 	// Hash the key and usage together to get the HMAC-MD5 key
-	h1 := hmac.NewMD5(c.key)
+	h1 := hmac.New(md5.New, c.key)
 	binary.Write(h1, binary.LittleEndian, rc4HmacUsage(usage))
 	K1 := h1.Sum(nil)
 
 	// Fill in out[:16] with the checksum
-	ch := hmac.NewMD5(K1)
+	ch := hmac.New(md5.New, K1)
 	ch.Write(out[16:24])
 	for _, d := range data {
 		ch.Write(d)
@@ -196,7 +196,7 @@ func (c *rc4hmac) Encrypt(salt []byte, usage int, data ...[]byte) []byte {
 	ch.Sum(out[:0])
 
 	// Calculate the RC4 key using the checksum
-	h3 := hmac.NewMD5(K1)
+	h3 := hmac.New(md5.New, K1)
 	h3.Write(out[:16])
 	K3 := h3.Sum(nil)
 
@@ -238,12 +238,12 @@ func (c *rc4hmac) Decrypt(salt []byte, algo, usage int, data []byte) ([]byte, er
 	}
 
 	// Hash the key and usage together to get the HMAC-MD5 key
-	h1 := hmac.NewMD5(c.key)
+	h1 := hmac.New(md5.New, c.key)
 	binary.Write(h1, binary.LittleEndian, rc4HmacUsage(usage))
 	K1 := h1.Sum(nil)
 
 	// Calculate the RC4 key using the checksum
-	h3 := hmac.NewMD5(K1)
+	h3 := hmac.New(md5.New, K1)
 	h3.Write(data[:16])
 	K3 := h3.Sum(nil)
 
@@ -253,7 +253,7 @@ func (c *rc4hmac) Decrypt(salt []byte, algo, usage int, data []byte) ([]byte, er
 	r.XORKeyStream(data[16:], data[16:])
 
 	// Recalculate the checksum using the decrypted data
-	ch := hmac.NewMD5(K1)
+	ch := hmac.New(md5.New, K1)
 	ch.Write(data[16:])
 	chk := ch.Sum(nil)
 
@@ -272,7 +272,7 @@ func fixparity(u uint64, expand bool) uint64 {
 		if expand {
 			b = (u >> uint(i*7)) & 0x7F
 		} else {
-			b = (u >> (uint(i*8)+1)) & 0x7F
+			b = (u >> (uint(i*8) + 1)) & 0x7F
 		}
 		// compute parity
 		p := b ^ (b >> 4)

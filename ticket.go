@@ -1,8 +1,8 @@
 package kerb
 
 import (
-	"encoding/asn1"
 	"encoding/binary"
+	"github.com/jmckaskill/asn1"
 	"io"
 	"net"
 	"strconv"
@@ -284,7 +284,7 @@ func DefaultDial(proto, realm string) (io.ReadWriteCloser, error) {
 
 	if proto == "udp" {
 		// For datagram connections, we retry up to three times, then give up
-		sock.SetReadTimeout(udpReadTimeout)
+		sock.SetReadDeadline(time.Now().Add(udpReadTimeout))
 	}
 
 	return sock, nil

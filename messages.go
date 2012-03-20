@@ -1,10 +1,10 @@
 package kerb
 
 import (
-	"encoding/asn1"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/jmckaskill/asn1"
 	"io"
 	"strings"
 	"time"
@@ -190,12 +190,12 @@ const (
 )
 
 const (
-	kerberosVersion      = 5
-	applicationClass     = 0x40
-	udpReadTimeout       = 3e9
-	maxUDPWrite          = 1400      // TODO: figure out better way of doing this
-	maxGSSWrapRead       = 64 * 1024 // TODO: remove this as a limitation
-	maxPDUSize           = 4 * 1024
+	kerberosVersion  = 5
+	applicationClass = 0x40
+	udpReadTimeout   = 3 * time.Second
+	maxUDPWrite      = 1400      // TODO: figure out better way of doing this
+	maxGSSWrapRead   = 64 * 1024 // TODO: remove this as a limitation
+	maxPDUSize       = 4 * 1024
 )
 
 var (

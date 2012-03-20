@@ -3,8 +3,8 @@ package kerb
 import (
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/asn1"
 	"encoding/binary"
+	"github.com/jmckaskill/asn1"
 	"io"
 	"time"
 )
@@ -153,12 +153,12 @@ func (t *Ticket) Connect(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, err 
 	subkey := mustGenerateKey(t.key.EncryptAlgo(appRequestAuthKey), rand.Reader)
 	now := t.cfg.now().UTC()
 	auth := authenticator{
-		ProtoVersion:   kerberosVersion,
-		ClientRealm:    t.crealm,
-		Client:         t.client,
-		Time:           time.Unix(now.Unix(), 0).UTC(), // round to the nearest second
-		Microseconds:   now.Nanosecond() / 1000,
-		Checksum:       checksumData{signGssFake, gsschk[:]},
+		ProtoVersion: kerberosVersion,
+		ClientRealm:  t.crealm,
+		Client:       t.client,
+		Time:         time.Unix(now.Unix(), 0).UTC(), // round to the nearest second
+		Microseconds: now.Nanosecond() / 1000,
+		Checksum:     checksumData{signGssFake, gsschk[:]},
 		SubKey: encryptionKey{
 			Algo: subkey.EncryptAlgo(appRequestAuthKey),
 			Key:  subkey.Key(),

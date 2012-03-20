@@ -34,7 +34,7 @@ func TestDesStringKey(t *testing.T) {
 	}
 }
 
-var gssDesTests = []struct{
+var gssDesTests = []struct {
 	data, key, out string
 }{
 	{"7654321 Now is the time for ", "0123456789abcdef", "f1d30f6849312ca4"},
@@ -53,9 +53,9 @@ func TestGssDes(t *testing.T) {
 	}
 }
 
-var cryptTests = []struct{
+var cryptTests = []struct {
 	algo int
-	key string
+	key  string
 	data string
 }{
 	{cryptDesCbcMd5, "cbc22fae235298e3", "0123456789abcdef"},
