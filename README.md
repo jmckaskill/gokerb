@@ -2,11 +2,18 @@ About
 -----
 This is a go library for kerberos V5.
 
+[![Build Status][1]][2]
+
+[1]: https://secure.travis-ci.org/jmckaskill/gokerb.png
+[2]: http://www.travis-ci.org/jmckaskill/gokerb
+
 Documentation
 -------------
-Documentation is maintained via godoc or see the following for online docs.
-http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gokerb
-http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gokerb/khttp
+Documentation is maintained via godoc (see gopkgdoc for the [gokerb] or [khttp]
+packages).
+
+[gokerb]: http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gokerb
+[khttp]: http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gokerb/khttp
 
 License (MIT)
 -------------
