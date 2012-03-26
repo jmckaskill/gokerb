@@ -9,7 +9,7 @@ install:
  - export GOPATH=$HOME
  - export PATH=$PATH:$HOME/go/bin
  - ln -s $HOME/builds/jmckaskill/gokerb $HOME/src/github.com/jmckaskill/gokerb
- - go get github.com/jmckaskill/gokerb
+ - go get -v github.com/jmckaskill/gokerb
 
 script:
  - cd $HOME/src/github.com/jmckaskill/gokerb && go build -v .
