@@ -533,10 +533,10 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	mustUnmarshal(etktdata, &etkt, encTicketParam)
 
 	now := c.cfg.now().UTC()
-	if etkt.From != *new(time.Time) && now.Before(etkt.From) {
+	if etkt.From != *new(time.Time) && now.Before(etkt.From.Add(-5*time.Minute)) {
 		panic(ErrTicket{"not valid yet"})
 	}
-	if now.After(etkt.Till) {
+	if now.After(etkt.Till.Add(5*time.Minute)) {
 		panic(ErrTicket{"expired"})
 	}
 	if bitStringToFlags(etkt.Flags)&TicketInvalid != 0 {
