@@ -44,7 +44,7 @@ var notill = asn1.RawValue{
 // connections such that if the remote receives multiple retries it discards
 // the latters as replays.
 func (r *request) sendRequest() (err error) {
-	//defer recoverMust(&err)
+	defer recoverMust(&err)
 
 	body := kdcRequestBody{
 		Client:       r.client,
@@ -140,7 +140,7 @@ func (r *request) sendRequest() (err error) {
 }
 
 func (r *request) recvReply() (tkt *Ticket, err error) {
-	//defer recoverMust(&err)
+	defer recoverMust(&err)
 
 	var data []byte
 

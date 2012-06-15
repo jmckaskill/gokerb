@@ -210,7 +210,7 @@ func (a *Authenticator) doBasicAuth(auth []byte) (user, realm string, err error)
 
 	go connectThread(tkt, readwriter{rrep, wreq}, done, 0)
 
-	_, user, realm, err = cred.Accept(readwriter{rreq, wrep}, 0)
+	_, user, realm, err = a.cred.Accept(readwriter{rreq, wrep}, 0)
 	if err != nil {
 		return "", "", err
 	}
