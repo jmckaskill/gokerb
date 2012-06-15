@@ -135,21 +135,21 @@ type CredConfig struct {
 }
 
 func (c *CredConfig) dial(proto, realm string) (io.ReadWriteCloser, error) {
-	if c.Dial != nil {
+	if c != nil && c.Dial != nil {
 		return c.Dial(proto, realm)
 	}
 	return DefaultDial(proto, realm)
 }
 
 func (c *CredConfig) now() time.Time {
-	if c.Now != nil {
+	if c != nil && c.Now != nil {
 		return c.Now()
 	}
 	return time.Now()
 }
 
 func (c *CredConfig) rand() io.Reader {
-	if c.Rand != nil {
+	if c != nil && c.Rand != nil {
 		return c.Rand
 	}
 	return rand.Reader
