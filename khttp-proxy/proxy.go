@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path"
 	"strconv"
 	"strings"
@@ -112,8 +113,7 @@ type ruleGroup struct {
 }
 
 type rule struct {
-	path        string
-	host        string
+	url         *url.URL
 	gmask       bitset
 	groups      []ruleGroup
 	hook        string
@@ -174,21 +174,24 @@ func parseConfigFile() {
 		args := strings.TrimSpace(s[cmdi:])
 
 		switch cmd {
-		case "path":
-			if len(p.path) > 0 {
+		case "rule":
+			if p.url != nil {
 				rules = append(rules, p)
 			}
-			p = rule{path: args}
-		case "host":
-			p.host = args
-			_, err = path.Match(args, "")
+			p.url, err = url.Parse(args)
+			check(err)
+			_, err = path.Match(p.url.Host, "")
 			if err != nil {
-				die(err, args)
+				die(err, p.url.Host)
+			}
+			_, err = path.Match(p.url.Path, "")
+			if err != nil {
+				die(err, p.url.Path)
 			}
 		case "group":
 			a := strings.SplitN(args, " ", 2)
 			if len(a) < 2 {
-				die("invalid group should be group name dn")
+				die("invalid group should be 'group <name> <dn>'")
 			}
 			dn := ldap.ObjectDN(a[1])
 			gidx, ok := groupmap[dn]
@@ -233,7 +236,9 @@ func parseConfigFile() {
 			cookieKey, err = ioutil.ReadFile("cookie_key")
 			check(err)
 		case "run-as":
-			runas = args
+			u, err := osuser.Lookup(args)
+			check(err)
+			runas = u.Uid
 		}
 	}
 
@@ -241,7 +246,7 @@ func parseConfigFile() {
 		die(err)
 	}
 
-	if len(p.path) > 0 {
+	if p.url != nil {
 		rules = append(rules, p)
 	}
 
@@ -254,7 +259,7 @@ func parseConfigFile() {
 		}
 
 		if p.handler == nil {
-			die("no handler defined for ", p.path)
+			die("no handler defined for ", p.url)
 		}
 
 		if len(p.stripPrefix) > 0 {
@@ -466,6 +471,35 @@ func (w *loggedResponse) WriteHeader(status int) {
 	w.w.WriteHeader(status)
 }
 
+func (r rule) matches(u *url.URL, user user) bool {
+	if r.url.Host != "" {
+		ok, _ := path.Match(r.url.Host, u.Host)
+		if !ok {
+			return false
+		}
+	}
+
+	if r.url.Path == "/" || r.url.Path == "" {
+		// catch all
+	} else if strings.HasSuffix(r.url.Path, "/") {
+		dir := u.Path
+		ok := false
+		for dir != "/" && !ok {
+			ok, _ = path.Match(r.url.Path[:len(r.url.Path)-1], dir)
+			dir = path.Dir(dir)
+		}
+		if !ok {
+			return false
+		}
+	} else {
+		if ok, _ := path.Match(r.url.Path, u.Path); !ok {
+			return false
+		}
+	}
+
+	return r.gmask.HasIntersection(user.gmask)
+}
+
 func main() {
 	var userlk sync.Mutex
 	var users map[string]user
@@ -539,21 +573,11 @@ func main() {
 			}
 
 			for _, p := range rules {
-				if p.host != "" && r.URL.Host != p.host && r.Host != p.host {
-					continue
+				if p.matches(r.URL, u) {
+					r.Header.Set("Remote-User", w.user)
+					p.handler.ServeHTTP(w, r)
+					return
 				}
-
-				if ok, _ := path.Match(p.path, r.URL.Path); !ok {
-					continue
-				}
-
-				if !u.gmask.HasIntersection(p.gmask) {
-					continue
-				}
-
-				r.Header.Set("Remote-User", w.user)
-				p.handler.ServeHTTP(w, r)
-				return
 			}
 
 		authFailed:
