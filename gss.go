@@ -536,7 +536,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	if etkt.From != *new(time.Time) && now.Before(etkt.From.Add(-5*time.Minute)) {
 		panic(ErrTicket{"not valid yet"})
 	}
-	if now.After(etkt.Till.Add(5*time.Minute)) {
+	if now.After(etkt.Till.Add(5 * time.Minute)) {
 		panic(ErrTicket{"expired"})
 	}
 	if bitStringToFlags(etkt.Flags)&TicketInvalid != 0 {
