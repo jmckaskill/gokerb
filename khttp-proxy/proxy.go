@@ -346,6 +346,7 @@ func logLines(pfx string, r io.Reader) error {
 			}
 		}
 	}
+	return nil
 }
 
 func runHooks(users map[string]user) error {
@@ -513,6 +514,9 @@ func main() {
 		},
 		Handler: http.HandlerFunc(func(w2 http.ResponseWriter, r *http.Request) {
 			var err error
+			var u user
+			var uok bool
+
 			w := &loggedResponse{w2, r, r.URL.String(), ""}
 
 			w.user, err = authCookie(r)
@@ -527,7 +531,7 @@ func main() {
 			}
 
 			userlk.Lock()
-			u, uok := users[w.user]
+			u, uok = users[w.user]
 			userlk.Unlock()
 
 			if !uok {
