@@ -139,7 +139,7 @@ var sslCert tls.Certificate
 var runas string
 
 func init() {
-	flag.StringVar(&configFile, "config", "", "config file")
+	flag.StringVar(&configFile, "config", "/etc/khttp-proxy.conf", "config file")
 }
 
 func dial(proto, realm string) (io.ReadWriteCloser, error) {
