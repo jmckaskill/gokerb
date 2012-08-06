@@ -627,6 +627,11 @@ func main() {
 			var err error
 			var u user
 			var uok bool
+			var rule *rule
+
+			if uid, err := strconv.Atoi(runas); err == nil {
+				syscall.Setuid(uid)
+			}
 
 			w := &loggedResponse{w2, r, r.URL.String(), ""}
 
