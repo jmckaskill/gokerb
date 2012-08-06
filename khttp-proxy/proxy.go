@@ -35,7 +35,7 @@ import (
 )
 
 func die(args ...interface{}) {
-	a := []interface{}{"fatal: ", args}
+	a := append([]interface{}{"fatal: "}, args...)
 	log.Print(a...)
 	os.Exit(256)
 }
@@ -84,11 +84,11 @@ func (b bitset) Clone() bitset {
 func (b *bitset) Set(i int) {
 	o := i >> 5
 	if o >= cap(*b) {
-		b2 := make(bitset, o)
+		b2 := make(bitset, o+1)
 		copy(b2, *b)
 		*b = b2
 	} else if o >= len(*b) {
-		*b = (*b)[:o]
+		*b = (*b)[:o+1]
 	}
 	(*b)[o] |= 1 << (uint(i) & 31)
 }
@@ -131,7 +131,7 @@ type user struct {
 
 var groups []ldap.ObjectDN
 var groupmap = make(map[ldap.ObjectDN]int)
-var rules []rule
+var rules []*rule
 var configFile string
 var cred *kerb.Credential
 var cookieKey []byte
@@ -156,11 +156,12 @@ func parseConfigFile() {
 	defer f.Close()
 
 	r := bufio.NewReader(f)
-	var p rule
+	var p *rule
 	var sslCrtFile, sslKeyFile string
 
-	for err != nil {
-		s, err := r.ReadString('\n')
+	for err == nil {
+		var s string
+		s, err = r.ReadString('\n')
 		if s == "" || s[0] == '#' {
 			continue
 		}
@@ -175,9 +176,10 @@ func parseConfigFile() {
 
 		switch cmd {
 		case "rule":
-			if p.url != nil {
+			if p != nil {
 				rules = append(rules, p)
 			}
+			p = new(rule)
 			p.url, err = url.Parse(args)
 			check(err)
 			_, err = path.Match(p.url.Host, "")
@@ -233,7 +235,7 @@ func parseConfigFile() {
 			_, err = cred.GetTicket("krbtgt/CTCT.NET", nil)
 			check(err)
 		case "cookie-key":
-			cookieKey, err = ioutil.ReadFile("cookie_key")
+			cookieKey, err = ioutil.ReadFile(args)
 			check(err)
 		case "run-as":
 			u, err := osuser.Lookup(args)
@@ -246,7 +248,7 @@ func parseConfigFile() {
 		die(err)
 	}
 
-	if p.url != nil {
+	if p != nil {
 		rules = append(rules, p)
 	}
 
@@ -267,11 +269,16 @@ func parseConfigFile() {
 		}
 	}
 
-	if sslCrtFile != "" {
-		sslCert, err = tls.LoadX509KeyPair(sslCrtFile, sslKeyFile)
-		check(err)
+	if sslCrtFile == "" || sslKeyFile == "" {
+		die("need to specify ssl certificate and key")
 	}
 
+	if cred == nil {
+		die("need to specify kerberos key")
+	}
+
+	sslCert, err = tls.LoadX509KeyPair(sslCrtFile, sslKeyFile)
+	check(err)
 }
 
 func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int, gmask bitset) error {
@@ -279,7 +286,7 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 		return errors.New("reached max group depth")
 	}
 
-	log.Print("LookupDN", dn)
+	log.Print("LookupDN ", dn)
 	obj, err := db.LookupDN(dn)
 	if err != nil {
 		return err
@@ -297,19 +304,21 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 
 	case *ad.Group:
 		log.Print("group", u)
-		if _, ok := groupmap[u.DN]; !ok {
-			gidx := len(groups)
+		gidx, ok := groupmap[u.DN]
+		if !ok {
+			gidx = len(groups)
 			groupmap[u.DN] = gidx
 			groups = append(groups, u.DN)
-			mask := gmask.Clone()
-			mask.Set(gidx)
-			for _, dn := range u.Member {
-				err := resolveUsers(db, dn, users, depth-1, mask)
-				if err == ldap.ErrNotFound {
-					continue
-				} else if err != nil {
-					return err
-				}
+		}
+
+		mask := gmask.Clone()
+		mask.Set(gidx)
+		for _, dn := range u.Member {
+			err := resolveUsers(db, dn, users, depth-1, mask)
+			if err == ldap.ErrNotFound {
+				continue
+			} else if err != nil {
+				return err
 			}
 		}
 	}
@@ -557,6 +566,7 @@ func main() {
 			if err != nil {
 				user, realm, err := auth.Authenticate(w, r)
 				if err != nil {
+					log.Print("auth failed: ", err)
 					goto authFailed
 				}
 
@@ -570,6 +580,13 @@ func main() {
 
 			if !uok {
 				goto authFailed
+			}
+
+			if r.URL.Host == "" {
+				r.URL.Host = r.Host
+			}
+			if r.URL.Scheme == "" {
+				r.URL.Scheme = "https"
 			}
 
 			for _, p := range rules {
@@ -592,12 +609,10 @@ func main() {
 	httpsConn, err := net.Listen("tcp", ":443")
 	check(err)
 
-	if runas != "" {
-		uid, err := strconv.Atoi(runas)
-		check(err)
-		err = syscall.Setuid(uid)
-		check(err)
-	}
+	uid, err := strconv.Atoi(runas)
+	check(err)
+	err = syscall.Setuid(uid)
+	check(err)
 
 	go httpServer.Serve(httpConn)
 	go httpsServer.Serve(tls.NewListener(httpsConn, httpsServer.TLSConfig))
@@ -615,6 +630,8 @@ func main() {
 			log.Print("Hook failed:", err)
 			goto sleep
 		}
+
+		log.Print("users successfully updated")
 
 		userlk.Lock()
 		db = newdb
