@@ -113,15 +113,16 @@ type ruleGroup struct {
 }
 
 type rule struct {
-	url         *url.URL
-	gmask       bitset
-	groups      []ruleGroup
-	hook        string
-	cgi         string
-	cgicwd      string
-	proxy       *url.URL
-	stripPrefix string
-	handler     http.Handler
+	url           *url.URL
+	gmask         bitset
+	groups        []ruleGroup
+	hook          string
+	cgi           string
+	cgicwd        string
+	proxy         *url.URL
+	stripPrefix   string
+	flushInterval time.Duration
+	handler       http.Handler
 }
 
 type user struct {
@@ -241,6 +242,9 @@ func parseConfigFile() {
 			u, err := osuser.Lookup(args)
 			check(err)
 			runas = u.Uid
+		case "flush-interval":
+			p.flushInterval, err = time.ParseDuration(args)
+			check(err)
 		}
 	}
 
@@ -480,7 +484,62 @@ func (w *loggedResponse) WriteHeader(status int) {
 	w.w.WriteHeader(status)
 }
 
-func (r rule) matches(u *url.URL, user user) bool {
+type writeFlusher interface {
+	http.Flusher
+	http.ResponseWriter
+}
+
+type maxLatencyWriter struct {
+	dst     writeFlusher
+	latency time.Duration
+
+	lk   sync.Mutex // protects init of done, as well Write + Flush
+	done chan bool
+}
+
+func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
+	m.lk.Lock()
+	defer m.lk.Unlock()
+	if m.done == nil {
+		m.done = make(chan bool)
+		go m.flushLoop()
+	}
+	n, err = m.dst.Write(p)
+	if err != nil {
+		m.done <- true
+	}
+	return
+}
+
+func (m *maxLatencyWriter) WriteHeader(status int) {
+	m.lk.Lock()
+	defer m.lk.Unlock()
+	if m.done == nil {
+		m.done = make(chan bool)
+		go m.flushLoop()
+	}
+	m.dst.WriteHeader(status)
+}
+
+func (m *maxLatencyWriter) Header() http.Header { return m.dst.Header() }
+
+func (m *maxLatencyWriter) flushLoop() {
+	t := time.NewTicker(m.latency)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			m.lk.Lock()
+			m.dst.Flush()
+			m.lk.Unlock()
+		case <-m.done:
+			return
+		}
+	}
+	panic("unreached")
+}
+
+func (r *rule) matches(u *url.URL, user user) bool {
 	if r.url.Host != "" {
 		ok, _ := path.Match(r.url.Host, u.Host)
 		if !ok {
@@ -507,6 +566,15 @@ func (r rule) matches(u *url.URL, user user) bool {
 	}
 
 	return r.gmask.HasIntersection(user.gmask)
+}
+
+func findRule(u *url.URL, user user) *rule {
+	for _, p := range rules {
+		if p.matches(u, user) {
+			return p
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -589,13 +657,22 @@ func main() {
 				r.URL.Scheme = "https"
 			}
 
-			for _, p := range rules {
-				if p.matches(r.URL, u) {
-					r.Header.Set("Remote-User", w.user)
-					p.handler.ServeHTTP(w, r)
-					return
-				}
+			rule = findRule(r.URL, u)
+			if rule == nil {
+				goto authFailed
 			}
+
+			r.Header.Set("Remote-User", w.user)
+			if wf, ok := w2.(writeFlusher); ok && rule.flushInterval != 0 {
+				w.w = &maxLatencyWriter{dst: wf, latency: rule.flushInterval}
+			}
+
+			rule.handler.ServeHTTP(w, r)
+
+			if lw, ok := w.w.(*maxLatencyWriter); ok {
+				close(lw.done)
+			}
+			return
 
 		authFailed:
 			auth.SetAuthHeader(w)
