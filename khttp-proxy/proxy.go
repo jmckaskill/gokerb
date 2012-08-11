@@ -151,6 +151,89 @@ func dial(proto, realm string) (io.ReadWriteCloser, error) {
 	return kerb.DefaultDial(proto, realm)
 }
 
+type writeFlusher interface {
+	http.Flusher
+	http.ResponseWriter
+}
+
+type maxLatencyWriter struct {
+	dst     writeFlusher
+	latency time.Duration
+
+	lk   sync.Mutex // protects init of done, as well Write + Flush
+	done chan bool
+}
+
+func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
+	m.lk.Lock()
+	defer m.lk.Unlock()
+	if m.done == nil {
+		m.done = make(chan bool)
+		go m.flushLoop()
+	}
+	n, err = m.dst.Write(p)
+	if err != nil {
+		m.done <- true
+	}
+	return
+}
+
+func (m *maxLatencyWriter) WriteHeader(status int) {
+	m.lk.Lock()
+	defer m.lk.Unlock()
+	if m.done == nil {
+		m.done = make(chan bool)
+		go m.flushLoop()
+	}
+	m.dst.WriteHeader(status)
+}
+
+func (m *maxLatencyWriter) Flush() {m.dst.Flush()}
+func (m *maxLatencyWriter) Header() http.Header { return m.dst.Header() }
+
+func (m *maxLatencyWriter) flushLoop() {
+	t := time.NewTicker(m.latency)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			m.lk.Lock()
+			m.dst.Flush()
+			m.lk.Unlock()
+		case <-m.done:
+			return
+		}
+	}
+	panic("unreached")
+}
+
+type maxLatencyHandler struct {
+	latency time.Duration
+	next http.Handler
+}
+
+func (m maxLatencyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if wf, ok := w.(writeFlusher); ok {
+		w = &maxLatencyWriter{dst: wf, latency: m.latency}
+	}
+
+	m.next.ServeHTTP(w, r)
+
+	if lw, ok := w.(*maxLatencyWriter); ok && lw.done != nil {
+		close(lw.done)
+	}
+}
+
+type redirector url.URL
+
+func (u *redirector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	tgt := new(url.URL)
+	*tgt = *(*url.URL)(u)
+	tgt.Path = path.Join(tgt.Path, r.URL.Path)
+	tgt.RawQuery = r.URL.RawQuery
+	http.Redirect(w, r, tgt.String(), http.StatusTemporaryRedirect)
+}
+
 func parseConfigFile() {
 	f, err := os.Open(configFile)
 	check(err)
@@ -245,6 +328,10 @@ func parseConfigFile() {
 		case "flush-interval":
 			p.flushInterval, err = time.ParseDuration(args)
 			check(err)
+		case "redirect":
+			u, err := url.Parse(args)
+			check(err)
+			p.handler = (*redirector)(u)
 		}
 	}
 
@@ -271,6 +358,10 @@ func parseConfigFile() {
 		if len(p.stripPrefix) > 0 {
 			p.handler = http.StripPrefix(p.stripPrefix, p.handler)
 		}
+
+		if p.flushInterval > 0 {
+			p.handler = &maxLatencyHandler{p.flushInterval, p.handler}
+		}
 	}
 
 	if sslCrtFile == "" || sslKeyFile == "" {
@@ -290,7 +381,6 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 		return errors.New("reached max group depth")
 	}
 
-	log.Print("LookupDN ", dn)
 	obj, err := db.LookupDN(dn)
 	if err != nil {
 		return err
@@ -298,7 +388,6 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 
 	switch u := obj.(type) {
 	case *ad.User:
-		log.Print("user", u)
 		pr := fmt.Sprintf("%s@%s", strings.ToLower(u.SAMAccountName), u.Realm)
 		if u2, ok := users[pr]; ok {
 			u2.gmask.SetMulti(gmask)
@@ -307,7 +396,6 @@ func resolveUsers(db *ad.DB, dn ldap.ObjectDN, users map[string]user, depth int,
 		}
 
 	case *ad.Group:
-		log.Print("group", u)
 		gidx, ok := groupmap[u.DN]
 		if !ok {
 			gidx = len(groups)
@@ -476,6 +564,12 @@ type loggedResponse struct {
 	user string
 }
 
+func (w *loggedResponse) Flush() {
+	if wf, ok := w.w.(http.Flusher); ok {
+		wf.Flush();
+	}
+}
+
 func (w *loggedResponse) Header() http.Header         { return w.w.Header() }
 func (w *loggedResponse) Write(d []byte) (int, error) { return w.w.Write(d) }
 
@@ -484,67 +578,13 @@ func (w *loggedResponse) WriteHeader(status int) {
 	w.w.WriteHeader(status)
 }
 
-type writeFlusher interface {
-	http.Flusher
-	http.ResponseWriter
-}
-
-type maxLatencyWriter struct {
-	dst     writeFlusher
-	latency time.Duration
-
-	lk   sync.Mutex // protects init of done, as well Write + Flush
-	done chan bool
-}
-
-func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
-	m.lk.Lock()
-	defer m.lk.Unlock()
-	if m.done == nil {
-		m.done = make(chan bool)
-		go m.flushLoop()
+func (r *rule) matches(u *url.URL, gmask bitset) bool {
+	if r.url.Scheme != u.Scheme {
+		return false
 	}
-	n, err = m.dst.Write(p)
-	if err != nil {
-		m.done <- true
-	}
-	return
-}
 
-func (m *maxLatencyWriter) WriteHeader(status int) {
-	m.lk.Lock()
-	defer m.lk.Unlock()
-	if m.done == nil {
-		m.done = make(chan bool)
-		go m.flushLoop()
-	}
-	m.dst.WriteHeader(status)
-}
-
-func (m *maxLatencyWriter) Header() http.Header { return m.dst.Header() }
-
-func (m *maxLatencyWriter) flushLoop() {
-	t := time.NewTicker(m.latency)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			m.lk.Lock()
-			m.dst.Flush()
-			m.lk.Unlock()
-		case <-m.done:
-			return
-		}
-	}
-	panic("unreached")
-}
-
-func (r *rule) matches(u *url.URL, user user) bool {
-	if r.url.Host != "" {
-		ok, _ := path.Match(r.url.Host, u.Host)
-		if !ok {
-			return false
-		}
+	if r.url.Host != u.Host {
+		return false
 	}
 
 	if r.url.Path == "/" || r.url.Path == "" {
@@ -565,12 +605,17 @@ func (r *rule) matches(u *url.URL, user user) bool {
 		}
 	}
 
-	return r.gmask.HasIntersection(user.gmask)
+	// if no groups were specified, then we allow everyone through
+	if len(r.gmask) > 0 && !r.gmask.HasIntersection(gmask) {
+		return false
+	}
+
+	return true
 }
 
-func findRule(u *url.URL, user user) *rule {
+func findRule(u *url.URL, gmask bitset) *rule {
 	for _, p := range rules {
-		if p.matches(u, user) {
+		if p.matches(u, gmask) {
 			return p
 		}
 	}
@@ -590,20 +635,9 @@ func main() {
 	flag.Parse()
 	parseConfigFile()
 
-	httpServer := http.Server{
-		Addr: ":80",
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			u := new(url.URL)
-			*u = *r.URL
-			if u.Host == "" && r.Host != "" {
-				u.Host = r.Host
-			}
-			u.Scheme = "https"
-			http.Redirect(w, r, u.String(), http.StatusTemporaryRedirect)
-		}),
-	}
+	httpAuth := khttp.NewAuthenticator(cred, &khttp.AuthConfig{Negotiate: true})
 
-	auth := khttp.NewAuthenticator(cred, &khttp.AuthConfig{
+	httpsAuth := khttp.NewAuthenticator(cred, &khttp.AuthConfig{
 		BasicLookup: func(u string) (string, string, error) {
 			userlk.Lock()
 			d := db
@@ -617,72 +651,91 @@ func main() {
 		Negotiate:  true,
 	})
 
+	handler := http.HandlerFunc(func(w2 http.ResponseWriter, r *http.Request) {
+		var u user
+		var uok bool
+		var rule *rule
+
+		if uid, err := strconv.Atoi(runas); err == nil {
+			syscall.Setuid(uid)
+		}
+
+		w := &loggedResponse{w2, r, r.URL.String(), ""}
+		
+		if r.URL.Host == "" {
+			r.URL.Host = r.Host
+		}
+
+		auth := httpAuth
+		r.URL.Scheme = "http"
+		if r.TLS != nil {
+			w.user, _ = authCookie(r)
+			auth = httpsAuth
+			r.URL.Scheme = "https"
+		}
+
+		if w.user == "" {
+			// See if there is a rule that doesn't require auth
+			rule = findRule(r.URL, nil)
+			if rule != nil {
+				r.Header.Del("Authorization")
+				rule.handler.ServeHTTP(w, r)
+				return
+			}
+
+			user, realm, err := auth.Authenticate(w, r)
+			if err != nil {
+				log.Print("auth failed: ", err)
+				goto authFailed
+			}
+
+			w.user = fmt.Sprintf("%s@%s", strings.ToLower(user), strings.ToUpper(realm))
+			if r.TLS != nil {
+				writeCookie(w, w.user)
+			}
+		}
+
+		r.Header.Del("Authorization")
+
+		userlk.Lock()
+		if users == nil {
+			userlk.Unlock()
+			http.Error(w, "The server is still booting up", http.StatusServiceUnavailable)
+			return
+		}
+		u, uok = users[w.user]
+		userlk.Unlock()
+
+		if !uok {
+			goto authFailed
+		}
+
+		if r.URL.Host == "" {
+			r.URL.Host = r.Host
+		}
+
+		rule = findRule(r.URL, u.gmask)
+		if rule == nil {
+			goto authFailed
+		}
+
+		r.Header.Set("Remote-User", w.user)
+		rule.handler.ServeHTTP(w, r)
+		return
+
+	authFailed:
+		auth.SetAuthHeader(w)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+
+	httpServer := http.Server{Addr: ":80", Handler: handler}
 	httpsServer := http.Server{
 		Addr: ":443",
+		Handler: handler,
 		TLSConfig: &tls.Config{
 			NextProtos:   []string{"http/1.1"},
 			Certificates: []tls.Certificate{sslCert},
 		},
-		Handler: http.HandlerFunc(func(w2 http.ResponseWriter, r *http.Request) {
-			var err error
-			var u user
-			var uok bool
-			var rule *rule
-
-			if uid, err := strconv.Atoi(runas); err == nil {
-				syscall.Setuid(uid)
-			}
-
-			w := &loggedResponse{w2, r, r.URL.String(), ""}
-
-			w.user, err = authCookie(r)
-			if err != nil {
-				user, realm, err := auth.Authenticate(w, r)
-				if err != nil {
-					log.Print("auth failed: ", err)
-					goto authFailed
-				}
-
-				w.user = fmt.Sprintf("%s@%s", user, realm)
-				writeCookie(w, w.user)
-			}
-
-			userlk.Lock()
-			u, uok = users[w.user]
-			userlk.Unlock()
-
-			if !uok {
-				goto authFailed
-			}
-
-			if r.URL.Host == "" {
-				r.URL.Host = r.Host
-			}
-			if r.URL.Scheme == "" {
-				r.URL.Scheme = "https"
-			}
-
-			rule = findRule(r.URL, u)
-			if rule == nil {
-				goto authFailed
-			}
-
-			r.Header.Set("Remote-User", w.user)
-			if wf, ok := w2.(writeFlusher); ok && rule.flushInterval != 0 {
-				w.w = &maxLatencyWriter{dst: wf, latency: rule.flushInterval}
-			}
-
-			rule.handler.ServeHTTP(w, r)
-
-			if lw, ok := w.w.(*maxLatencyWriter); ok {
-				close(lw.done)
-			}
-			return
-
-		authFailed:
-			auth.SetAuthHeader(w)
-			w.WriteHeader(http.StatusUnauthorized)
-		}),
 	}
 
 	httpConn, err := net.Listen("tcp", ":80")
