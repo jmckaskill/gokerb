@@ -20,7 +20,7 @@ type Transport struct {
 	// Credential to use to authenticate outgoing requests
 	Credential *kerb.Credential
 	// Next specifies the next transport to be used or http.DefaultTransport if nil.
-	Next           http.RoundTripper
+	Next http.RoundTripper
 	// Flags to pass to ticket.Connect. Use kerb.MutualAuth to authenticate the server.
 	ConnectFlags int
 }
@@ -28,6 +28,7 @@ type Transport struct {
 var (
 	// Error returned from Authenticate
 	ErrNoAuth = errors.New("khttp: no or invalid authorization header")
+	ErrHost = errors.New("khttp: no credential for provided host")
 
 	negotiate       = "Negotiate "
 	basic           = "Basic "
@@ -124,7 +125,7 @@ type AuthConfig struct {
 	// Authenticate.
 	BasicLookup func(username string) (user, realm string, err error)
 	// BasicRealm is the basic auth realm sent to the client if any.
-	BasicRealm          string
+	BasicRealm string
 	// Negotiate enables/disables the Negotiate WWW auth mechanism which
 	// allows a browser to send a kerberos ticket directly.
 	Negotiate bool
@@ -133,14 +134,14 @@ type AuthConfig struct {
 // Authenticator is a handler for checking an incoming request.
 // It supports both the Negotiate and Basic auth mechanisms
 type Authenticator struct {
-	cfg  *AuthConfig
-	cred *kerb.Credential
+	cfg   *AuthConfig
+	creds []*kerb.Credential
 }
 
-func NewAuthenticator(c *kerb.Credential, cfg *AuthConfig) *Authenticator {
+func NewAuthenticator(c []*kerb.Credential, cfg *AuthConfig) *Authenticator {
 	a := &Authenticator{
-		cfg:  cfg,
-		cred: c,
+		cfg:   cfg,
+		creds: c,
 	}
 
 	return a
@@ -157,11 +158,21 @@ func (a *Authenticator) SetAuthHeader(w http.ResponseWriter) {
 	}
 }
 
-func (a *Authenticator) doNegotiate(w http.ResponseWriter, auth []byte) (user, realm string, err error) {
+func (a *Authenticator) credential(r *http.Request) *kerb.Credential {
+	for _, c := range a.creds {
+		pr := c.Principal()
+		if strings.HasPrefix(pr, "HTTP/") && r.Host == pr[len("HTTP/"):] {
+			return c
+		}
+	}
+	return nil
+}
+
+func (a *Authenticator) doNegotiate(w http.ResponseWriter, c *kerb.Credential, auth []byte) (user, realm string, err error) {
 	rbuf := bytes.NewBuffer(auth)
 	wbuf := new(bytes.Buffer)
 
-	_, user, realm, err = a.cred.Accept(readwriter{rbuf, wbuf}, 0)
+	_, user, realm, err = c.Accept(readwriter{rbuf, wbuf}, 0)
 	if err != nil {
 		return "", "", err
 	}
@@ -174,7 +185,7 @@ func (a *Authenticator) doNegotiate(w http.ResponseWriter, auth []byte) (user, r
 	return user, realm, nil
 }
 
-func (a *Authenticator) doBasicAuth(auth []byte) (user, realm string, err error) {
+func (a *Authenticator) doBasicAuth(c *kerb.Credential, auth []byte) (user, realm string, err error) {
 	i := bytes.IndexRune(auth, ':')
 	if i < 0 {
 		return "", "", ErrNoAuth
@@ -192,7 +203,7 @@ func (a *Authenticator) doBasicAuth(auth []byte) (user, realm string, err error)
 		return "", "", err
 	}
 
-	tkt, err := cred.GetTicket(a.cred.Principal(), nil)
+	tkt, err := cred.GetTicket(c.Principal(), nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -206,7 +217,7 @@ func (a *Authenticator) doBasicAuth(auth []byte) (user, realm string, err error)
 
 	go connectThread(tkt, readwriter{rrep, wreq}, done, 0)
 
-	_, user, realm, err = a.cred.Accept(readwriter{rreq, wrep}, 0)
+	_, user, realm, err = c.Accept(readwriter{rreq, wrep}, 0)
 	if err != nil {
 		return "", "", err
 	}
@@ -240,12 +251,18 @@ func (a *Authenticator) Authenticate(w http.ResponseWriter, r *http.Request) (us
 		return "", "", err
 	}
 
+	c := a.credential(r)
+
+	if c == nil {
+		return "", "", ErrHost
+	}
+
 	switch {
 	case a.cfg.Negotiate && auth == negotiate:
-		return a.doNegotiate(w, data)
+		return a.doNegotiate(w, c, data)
 
 	case a.cfg.BasicLookup != nil && auth == basic:
-		return a.doBasicAuth(data)
+		return a.doBasicAuth(c, data)
 	}
 
 	return "", "", ErrNoAuth
