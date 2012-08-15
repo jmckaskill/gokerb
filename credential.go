@@ -38,43 +38,11 @@ package kerb
 
 import (
 	"crypto/rand"
-	"fmt"
 	"io"
-	"net"
 	"strings"
 	"sync"
 	"time"
 )
-
-// ResolveService resolves the canonical service principal for a given service
-// on a given host.
-//
-// Host will be converted to the canonical FQDN and appended to service as
-// <service>/<canon fqdn> to create the principal.
-//
-// Addr must already be resolved to an IP address eg with
-// net.Conn.RemoteAddr.String. This is required because service names are
-// specific to an individual server whereas DNS names may resolve to multiple
-// different servers.
-func ResolveService(service, addr string) (string, error) {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-
-	names, err := net.LookupAddr(host)
-	if err != nil {
-		return "", err
-	}
-
-	// Strip any trailing dot
-	name := names[0]
-	if strings.HasSuffix(name, ".") {
-		name = name[:len(name)-1]
-	}
-
-	return fmt.Sprintf("%s/%s", service, name), nil
-}
 
 func chooseAlgorithm(msg *errorMessage) (etype int, salt string, err error) {
 	defer recoverMust(&err)

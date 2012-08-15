@@ -70,11 +70,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	service, err := kerb.ResolveService("HTTP", addr[0])
-	if err != nil {
-		return nil, err
-	}
-
+	service := fmt.Sprintf("HTTP/%s", addr[0])
 	tkt, err := t.Credential.GetTicket(service, nil)
 	if err != nil {
 		return nil, err
