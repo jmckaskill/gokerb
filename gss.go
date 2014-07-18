@@ -4,9 +4,10 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
-	"github.com/jmckaskill/asn1"
 	"io"
 	"time"
+
+	"github.com/dojodominator/asn1"
 )
 
 // GSS requests are a bit screwy in that they are partially asn1 The format
@@ -491,7 +492,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	defer recoverMust(&err)
 
 	// Get the AP_REQ
-	breq := [4096]byte{}
+	breq := [10000]byte{}
 	reqdata := mustRead(rw, breq[:])
 	oid, reqdata := mustDecodeGSSWrapper(reqdata)
 
