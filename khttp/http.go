@@ -160,9 +160,10 @@ func (a *Authenticator) SetAuthHeader(w http.ResponseWriter) {
 }
 
 func (a *Authenticator) credential(r *http.Request) *kerb.Credential {
+	host := strings.Split(r.Host, ":")[0]
 	for _, c := range a.creds {
 		pr := c.Principal()
-		if strings.HasPrefix(pr, "HTTP/") && r.Host == pr[len("HTTP/"):] {
+		if strings.HasPrefix(pr, "HTTP/") && host == strings.ToLower(pr[len("HTTP/"):]) {
 			return c
 		}
 	}
