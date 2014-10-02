@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dojodominator/asn1"
+	"github.com/jmckaskill/asn1"
 )
 
 // Remote error codes
