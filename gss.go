@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"io"
+	"log"
 	"time"
 
 	"github.com/dojodominator/asn1"
@@ -492,6 +493,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	defer recoverMust(&err)
 
 	// Get the AP_REQ
+	log.Printf("Starting accept")
 	breq := [10000]byte{}
 	reqdata := mustRead(rw, breq[:])
 	oid, reqdata := mustDecodeGSSWrapper(reqdata)
@@ -521,6 +523,8 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	mustUnmarshal(req.Ticket.FullBytes, &tkt, ticketParam)
 	must(tkt.ProtoVersion == kerberosVersion)
 
+	log.Printf("tkt-Realm: %s, c-realm: %s", tkt.Realm, c.realm)
+	log.Printf("tkt-Service: %+v, c-principal: %+v", tkt.Service, c.principal)
 	if tkt.Realm != c.realm || !nameEquals(tkt.Service, c.principal) {
 		panic(ErrTicket{"wrong service"})
 	}
@@ -556,6 +560,9 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 
 	must(auth.ProtoVersion == kerberosVersion)
 	must(auth.ClientRealm == etkt.ClientRealm && nameEquals(auth.Client, etkt.Client))
+	if !(-5*time.Minute < now.Sub(auth.Time) && now.Sub(auth.Time) < 5*time.Minute) {
+		log.Printf("Client time is too far off of current system time: %s, %s", auth.Time.UTC(), time.Now().UTC())
+	}
 	must(-5*time.Minute < now.Sub(auth.Time) && now.Sub(auth.Time) < 5*time.Minute)
 
 	// Check the fake checksum.
@@ -684,6 +691,7 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	case saslConfidential:
 		g.conf = true
 	default:
+		log.Printf("Switch default")
 		panic(ErrProtocol)
 	}
 
