@@ -166,6 +166,8 @@ func (a *Authenticator) credential(r *http.Request) *kerb.Credential {
 		pr := c.Principal()
 		if strings.HasPrefix(pr, "HTTP/") && host == strings.ToLower(pr[len("HTTP/"):]) {
 			return c
+		} else {
+			log.Printf("Looking and didn't find: '%s'.  Expecting: 'HTTP/%s'", pr, host)
 		}
 	}
 	return nil
