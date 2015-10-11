@@ -2,7 +2,7 @@ package kerb
 
 import (
 	"bytes"
-	"code.google.com/p/go.crypto/md4"
+	"golang.org/x/crypto/md4"
 	"crypto/cipher"
 	"crypto/des"
 	"crypto/hmac"
