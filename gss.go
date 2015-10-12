@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"io"
+	"io/ioutil"
 	"log"
 	"time"
 
@@ -493,8 +494,13 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	defer recoverMust(&err)
 
 	// Get the AP_REQ
-	breq := [10000]byte{}
-	reqdata := mustRead(rw, breq[:])
+	var reqdata []byte
+	reqdata, err = ioutil.ReadAll(rw)
+	if err != nil && err != io.EOF {
+		log.Printf("Error in accept reading from rw: %T: %+v", err, err)
+		return
+	}
+	//reqdata := mustRead(rw, breq)
 	oid, reqdata := mustDecodeGSSWrapper(reqdata)
 
 	spnego := oid.Equal(gssSpnegoOid)
