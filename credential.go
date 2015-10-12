@@ -39,6 +39,7 @@ package kerb
 import (
 	"crypto/rand"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -261,6 +262,8 @@ func (c *Credential) getTgt(realm string, ctill time.Time) (*Ticket, string, err
 
 	tgt, err := r.do()
 	if err != nil {
+		//log.Printf("Returning with error after do: %+v", err)
+		log.Panicf("Returning with error after do: %+v", err)
 		return nil, "", err
 	}
 

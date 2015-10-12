@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -165,6 +166,8 @@ func (a *Authenticator) credential(r *http.Request) *kerb.Credential {
 		pr := c.Principal()
 		if strings.HasPrefix(pr, "HTTP/") && host == strings.ToLower(pr[len("HTTP/"):]) {
 			return c
+		} else {
+			log.Printf("Looking and didn't find: '%s'.  Expecting: 'HTTP/%s'", pr, host)
 		}
 	}
 	return nil
@@ -176,6 +179,7 @@ func (a *Authenticator) doNegotiate(w http.ResponseWriter, c *kerb.Credential, a
 
 	_, user, realm, err = c.Accept(readwriter{rbuf, wbuf}, 0)
 	if err != nil {
+		log.Printf("Error accept")
 		return "", "", err
 	}
 
@@ -250,12 +254,14 @@ func (a *Authenticator) Authenticate(w http.ResponseWriter, r *http.Request) (us
 	auth, data, err := splitAuth(r.Header.Get(authorization))
 
 	if err != nil {
+		log.Printf("Error splitting auth")
 		return "", "", err
 	}
 
 	c := a.credential(r)
 
 	if c == nil {
+		log.Printf("a.credential error")
 		return "", "", ErrHost
 	}
 
