@@ -2,12 +2,13 @@ package kerb
 
 import (
 	"encoding/binary"
-	"github.com/jmckaskill/asn1"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jmckaskill/asn1"
 )
 
 type request struct {

@@ -4,9 +4,12 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
-	"github.com/jmckaskill/asn1"
 	"io"
+	"io/ioutil"
+	"log"
 	"time"
+
+	"github.com/jmckaskill/asn1"
 )
 
 // GSS requests are a bit screwy in that they are partially asn1 The format
@@ -491,8 +494,13 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 	defer recoverMust(&err)
 
 	// Get the AP_REQ
-	breq := [4096]byte{}
-	reqdata := mustRead(rw, breq[:])
+	var reqdata []byte
+	reqdata, err = ioutil.ReadAll(rw)
+	if err != nil && err != io.EOF {
+		log.Printf("Error in accept reading from rw: %T: %+v", err, err)
+		return
+	}
+	//reqdata := mustRead(rw, breq)
 	oid, reqdata := mustDecodeGSSWrapper(reqdata)
 
 	spnego := oid.Equal(gssSpnegoOid)
@@ -555,6 +563,9 @@ func (c *Credential) Accept(rw io.ReadWriter, flags int) (gssrw io.ReadWriter, u
 
 	must(auth.ProtoVersion == kerberosVersion)
 	must(auth.ClientRealm == etkt.ClientRealm && nameEquals(auth.Client, etkt.Client))
+	if !(-5*time.Minute < now.Sub(auth.Time) && now.Sub(auth.Time) < 5*time.Minute) {
+		log.Printf("Client time is too far off of current system time: %s, %s", auth.Time.UTC(), time.Now().UTC())
+	}
 	must(-5*time.Minute < now.Sub(auth.Time) && now.Sub(auth.Time) < 5*time.Minute)
 
 	// Check the fake checksum.
