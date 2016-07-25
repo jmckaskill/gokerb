@@ -9,11 +9,10 @@ This is a go library for kerberos V5.
 
 Documentation
 -------------
-Documentation is maintained via godoc (see gopkgdoc for the [gokerb] or [khttp]
-packages).
+Documentation is maintained via godoc (see the [gokerb] or [khttp] packages).
 
-[gokerb]: http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gokerb
-[khttp]: http://gopkgdoc.appspot.com/pkg/github.com/jmckaskill/gokerb/khttp
+[gokerb]: https://godoc.org/github.com/jmckaskill/gokerb
+[khttp]: https://godoc.org/github.com/jmckaskill/gokerb/khttp
 
 License (MIT)
 -------------
@@ -36,5 +35,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
-
